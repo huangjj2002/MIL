@@ -18,9 +18,7 @@ FINAL_CSV_NAME = 'embed_data.csv'
 # 进程数
 NUM_WORKERS = max(1, os.cpu_count() - 2) 
 
-# [新增] 强制 Resize 尺寸 (Width, Height)
-# 注意：cv2.resize 的参数顺序是 (宽, 高)。
-# 对应 main.py 中的默认 img_size=[1520, 912] (通常是 H, W)，这里设置为 (912, 1520)
+
 TARGET_SIZE = (912, 1520) 
 # ===========================================
 
@@ -53,15 +51,14 @@ def convert_dicom_to_png(dicom_path, output_path):
             
         image = image.astype(np.uint8)
 
-        # [新增] Resize 逻辑
+
         if TARGET_SIZE is not None:
-            # cv2.resize 接受 (Width, Height)
+    
             image = cv2.resize(image, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
 
         cv2.imwrite(output_path, image)
         return True
     except Exception as e:
-        # print(f"Error converting {dicom_path}: {e}") # 可选：打印错误信息帮助调试
         return False
 
 def process_single_row(row_data, embed_root, images_out_root):
@@ -83,18 +80,14 @@ def process_single_row(row_data, embed_root, images_out_root):
 
     os.makedirs(patient_dir, exist_ok=True)
     
-    target_path = os.path.join(patient_dir, image_id) # 注意：这里可能需要加后缀 .png，或者 output_path 已经包含后缀
-    # 根据原代码逻辑，image_id 似乎没有后缀，OpenCV 保存需要后缀名才能正确编码，
-    # 但原代码直接用 image_id 作为文件名，且 cv2.imwrite(target_path, image)。
-    # 如果 image_id 里没有 .png，cv2可能会报错或者不知道存什么格式。
-    # 建议加上后缀，但为了保持"其他地方不变"，这里暂按原样，除非 image_id 本身带后缀。
-    # 稳妥起见，建议在 target_path 强制加 .png，如下行所示（如果 image_id 已经带了后缀则会重复，请自行确认）：
+    target_path = os.path.join(patient_dir, image_id) 
+
     if not target_path.lower().endswith('.png'):
         target_path += ".png"
 
     success = False
     
-    # 检查目标文件是否存在且大小大于0
+
     if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
         success = True
     
@@ -106,8 +99,7 @@ def process_single_row(row_data, embed_root, images_out_root):
         if 'dicom_path' in row_data:
             del row_data['dicom_path']
         
-        # [可选] 更新 row_data 中的 filename 为新的 png 文件名
-        # row_data['image_file_path'] = target_path 
+
         
         return row_data
     else:
@@ -115,7 +107,7 @@ def process_single_row(row_data, embed_root, images_out_root):
 
 def main():
     if not os.path.exists(INPUT_LIST_CSV):
-        print(f"错误：找不到输入文件 {INPUT_LIST_CSV}")
+        print(f"错误：找不到csv文件 {INPUT_LIST_CSV}")
         return
 
     df = pd.read_csv(INPUT_LIST_CSV)
@@ -123,10 +115,10 @@ def main():
     images_out_root = os.path.join(OUTPUT_DIR, "images_png")
     ensure_dir(images_out_root)
     
-    print(f">>> Step 2: 开始转换 {len(df)} 张图像...")
-    print(f"    使用核心数: {NUM_WORKERS}")
-    print(f"    源目录: {EMBED_ROOT}")
-    print(f"    目标尺寸: {TARGET_SIZE}")
+    print(f"    转换 {len(df)} 张图像...")
+    print(f"    进程数: {NUM_WORKERS}")
+    print(f"    源目录地址: {EMBED_ROOT}")
+    print(f"    目标图像尺寸: {TARGET_SIZE}")
     
     valid_records = []
     
@@ -152,9 +144,9 @@ def main():
         final_df = pd.DataFrame(valid_records)
         final_csv_path = os.path.join(OUTPUT_DIR, FINAL_CSV_NAME)
         final_df.to_csv(final_csv_path, index=False)
-        print(f">>> 最终 CSV 已保存: {final_csv_path}")
+        print(f"CSV 已保存: {final_csv_path}")
     else:
-        print(">>> 未生成任何有效数据，请检查路径设置。")
+        print("未找到数据，请检查路径设置。")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support() 
