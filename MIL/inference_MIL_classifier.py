@@ -87,7 +87,33 @@ def run_eval(run_path, args, device):
 
     # Print aggregated metrics across scales
     print(f"Aggregated Results --> Test F1-Score: {test_results['aggregated']['f1']:.4f} | Test Bacc: {test_results['aggregated']['bacc']:.4f} | Test ROC-AUC: {test_results['aggregated']['auc_roc']:.4f}")
+    # 1. 确保输出目录存在 (将字符串转换为 Path 对象)
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # 2. 绘制并保存 ROC 曲线
+    # 使用 run_path 的最后一部分作为文件名前缀 (例如 "run_0")
+    run_name = os.path.basename(run_path) 
+    
+    print(f"Saving ROC curve and Confusion Matrix to {output_path} ...")
+    
+    try:
+        # 绘制 ROC 曲线
+        ROC_curves(test_targs, test_probs, run_name, output_path)
         
+        # 绘制混淆矩阵 (需要判断是多尺度还是单尺度结果)
+        if 'aggregated' in test_results and 'cf_matrix' in test_results['aggregated']:
+            cm = test_results['aggregated']['cf_matrix']
+        elif 'cf_matrix' in test_results:
+            cm = test_results['cf_matrix']
+        else:
+            cm = None
+            
+        if cm is not None:
+            plot_confusion_matrix(cm, label_dict, run_name, output_path)
+            
+    except Exception as e:
+        print(f"Warning: Failed to plot curves. Error: {e}")
     final_results_data = {}
     
     # Append metrics for all scales
@@ -116,7 +142,8 @@ def Eval(args, device):
         
         print(f'\nRunning eval for model run nº{run_idx + args.start_run}....')
         
-        run_path = os.path.join(args.resume, f'run_{args.start_run + run_idx}')
+        #run_path = os.path.join(args.resume, f'run_{args.start_run + run_idx}')
+        run_path = os.path.join(args.resume, f'fold_{args.start_run + run_idx}')
         
         # Run the evaluation and get results as DataFrame
         run_results_df = run_eval(run_path, args, device) 
@@ -126,11 +153,11 @@ def Eval(args, device):
         
         all_results.append(run_results_df)
     
-    if args.n_runs > 1: 
+    
 
-        # Combine all runs into a single DataFrame
-        combined_df = pd.concat(all_results, ignore_index=True)
-        
+    # Combine all runs into a single DataFrame
+    combined_df = pd.concat(all_results, ignore_index=True)
+    if args.n_runs > 1:  
         # Calculate mean and std for specific columns
         mean_std = combined_df.drop('runs', axis=1).agg(['mean', 'std']).reset_index(drop=True)
         mean_std['runs'] = ['mean', 'std']
@@ -138,8 +165,9 @@ def Eval(args, device):
         # Append mean and std to the original DataFrame
         combined_df = pd.concat([combined_df, mean_std]).reset_index(drop=True)
 
-        print(combined_df)
+    print(combined_df)
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = os.path.join(args.output_dir, f'{args.dataset}_eval_summary.csv')
+    combined_df.to_csv(output_path, index=False)
+    print(f"Results saved to {output_path}")
     
-        output_path = os.path.join(args.resume, f'{args.dataset}_eval_summary.csv')
-        combined_df.to_csv(output_path, index=False)
-        
