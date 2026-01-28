@@ -13,7 +13,7 @@
    ```
 2. **数据处理**  
 使用tools文件下的generate_csv.py来对EMBED数据进行处理，要修改CLINICAL_FILE，METADATA_FILE，以及OUTPUT_CSV_FOR_CONVERSION文件，
-CLINCAL_FILE应指向EMBED_OpenData_clinical.csv的地址，METADATA_FILE用于指向EMBED_OpenData_metadata.csv的地址，最后OUTPUT_CSV_FOR_CONVERSION用于指定输出的csv的路径。  
+CLINCAL_FILE应指向EMBED_OpenData_clinical.csv的地址，METADATA_FILE用于指向EMBED_OpenData_metadata.csv的地址，最后OUTPUT_CSV_FOR_CONVERSION用于指定输出的csv的路径。在该脚本一次只能筛选implant或者unimplant样例，需要运行两次才能筛选出implant样例以及非implant样例。
 在使用generate_csv.py生成csv文件后使用embed_data.py将dicom文件转换成png文件。INPUT_LIST_CSV指向generate_csv.py生成的csv文件。EMBED_ROOT指向EMBED数据集的根目录，OUTPUT_DIR指向
 图片的输出地址，FINAL_CSV_NAME用于指定最终用于模型输入的csv文件的生成路径。  
 在根项目下创建models文件夹用于存放模型文件，将用于特征提取的EfficientNet-B2 image encoder存放在models下[EfficientNet-B2下载地址](https://huggingface.co/shawn24/Mammo-CLIP/blob/main/Pre-trained-checkpoints/b2-model-best-epoch-10.tar)
