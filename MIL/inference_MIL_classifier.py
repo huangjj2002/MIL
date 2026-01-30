@@ -87,21 +87,19 @@ def run_eval(run_path, args, device):
 
     # Print aggregated metrics across scales
     print(f"Aggregated Results --> Test F1-Score: {test_results['aggregated']['f1']:.4f} | Test Bacc: {test_results['aggregated']['bacc']:.4f} | Test ROC-AUC: {test_results['aggregated']['auc_roc']:.4f}")
-    # 1. 确保输出目录存在 (将字符串转换为 Path 对象)
+
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # 2. 绘制并保存 ROC 曲线
-    # 使用 run_path 的最后一部分作为文件名前缀 (例如 "run_0")
     run_name = os.path.basename(run_path) 
     
     print(f"Saving ROC curve and Confusion Matrix to {output_path} ...")
     
     try:
-        # 绘制 ROC 曲线
+
         ROC_curves(test_targs, test_probs, run_name, output_path)
         
-        # 绘制混淆矩阵 (需要判断是多尺度还是单尺度结果)
+  
         if 'aggregated' in test_results and 'cf_matrix' in test_results['aggregated']:
             cm = test_results['aggregated']['cf_matrix']
         elif 'cf_matrix' in test_results:
