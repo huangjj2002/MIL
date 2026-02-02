@@ -417,7 +417,7 @@ def k_experiment(train_df, val_df, output_path, args, device):
     model = build_model(args)
     if args.resume and os.path.exists(args.resume):
         print(f"Loading checkpoint for fine-tuning from: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu',weights_only=False)
         
         msg = model.load_state_dict(checkpoint['model'], strict=False)
         print(f"Checkpoint loaded. Message: {msg}")

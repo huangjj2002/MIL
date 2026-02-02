@@ -1,14 +1,9 @@
-# internal imports 
-from MIL.MIL_experiment import do_experiments
-from MIL.roi_eval import ROI_Eval
-from MIL.inference_MIL_classifier import Eval 
-from utils.generic_utils import seed_all
 
 #external imports 
 import warnings
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-import torch
+from datetime import datetime
+
+
 
 warnings.filterwarnings("ignore")
 import argparse
@@ -20,7 +15,11 @@ from pathlib import Path
 
 def config():
     parser = argparse.ArgumentParser()
-    
+    parser.add_argument(
+    "--gpu_id", type=str, default="0",
+    help="GPU id to use, e.g. 0 or 1 (single GPU)")
+
+
     # Folders
     parser.add_argument('--output_dir', metavar='DIR',default='Mammo-CLIP-output/out_splits_new', help='path to output logs')
     parser.add_argument("--data_dir",default="datasets/Vindir-mammoclip",type=str, help="Path to data file")
@@ -165,6 +164,13 @@ def config():
 
 
 def main(args):
+    import os
+    import torch
+    from utils.generic_utils import seed_all
+    from MIL.MIL_experiment import do_experiments
+    from MIL.roi_eval import ROI_Eval
+    from MIL.inference_MIL_classifier import Eval
+
     
     seed_all(args.seed)
     
@@ -276,4 +282,9 @@ def main(args):
 
 if __name__ == "__main__":
     args = config()
+    # internal imports 
+
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    print(f"[INFO] Using GPU {args.gpu_id}")
     main(args)
