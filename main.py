@@ -210,6 +210,8 @@ def main(args):
             print(f"[Auto-Config] Label: {args.label}")
             print(f"[Auto-Config] Stats: Neg={int(num_neg)}, Pos={int(num_pos)}")
             print(f"[Auto-Config] Calculated new BCE_weight: {args.BCE_weights:.4f}\n")
+        else:
+            args.BCE_weights = 1.0
 
 
         

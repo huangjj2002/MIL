@@ -8,20 +8,20 @@ from tqdm import tqdm
 
 
 
-IN_CSV = "./new_csv.csv" 
-OUT_ROOT = "F:/data"  
+IN_CSV = "./new_csv.csv"#被筛选出的implant的csv文件地址 
+OUT_ROOT = "F:/data"  #输出地址
 
-IMG_DIR = "images_png"          
-OUT_CSV_NAME = "embed_data.csv" 
+IMG_DIR = "images_png" #png的存储路径         
+OUT_CSV_NAME = "embed_data.csv" #用于模型输入的csv文件
+#图片的存储路径为OUT_ROOT/IMG_DIR/empi_anon/.png
 
-
-DICOM_COL = "path_of_dicom"
+DICOM_COL = "anon_dicom_path"#IN_CSV文件中记录dicom路径的列名
 PATIENT_COL = "empi_anon"
-LABEL_COL = "laterality_label"  
+LABEL_COL = "laterality_label"  #用以指定标签名
 
 
 SUFFIX_MODE = "replace_ext" 
-IMG_EXT = ".png"
+IMG_EXT = ".png"#文件后缀名
 
 
 SPLIT_VALUE = "training"
@@ -154,7 +154,7 @@ def main():
     out_img_root.mkdir(parents=True, exist_ok=True)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/5] 读取 CSV: {in_csv}")
+    print(f"读取 CSV: {in_csv}")
     df = pd.read_csv(in_csv, low_memory=False)
 
     required = [DICOM_COL, PATIENT_COL, LABEL_COL]
@@ -164,7 +164,6 @@ def main():
 
 
     if MAKE_TEST_SPLIT:
-        print("[INFO] 生成 test split（按 patient 分组）")
         rng = np.random.RandomState(TEST_RANDOM_SEED)
         patients = df[PATIENT_COL].astype(str).unique().tolist()
         rng.shuffle(patients)
@@ -174,7 +173,6 @@ def main():
     else:
         df["_split"] = SPLIT_VALUE
 
-    print(f"[2/5] 构建 records（输出 CSV 每行一条，保留原始重复行）")
     records = []
     unique_map = {}
 
@@ -200,12 +198,6 @@ def main():
     total_unique_tasks = len(unique_map)
     dedup_reduced = total_rows - total_unique_tasks
 
-    print(f"[INFO] 原 CSV 行数: {total_rows}")
-    print(f"[INFO] 唯一转换任务数(out_png 去重): {total_unique_tasks}")
-    print(f"[INFO] 去重减少的重复转换: {dedup_reduced}")
-
-    print(f"[3/5] 开始并行转换（统一输出尺寸 H={TARGET_SIZE_HW[0]} W={TARGET_SIZE_HW[1]}），输出到: {out_img_root}")
-    print(f"[INFO] workers={MAX_WORKERS} mode={'process' if USE_MULTIPROCESS else 'thread'}")
 
     ok = skipped = fail = 0
     fail_samples = []
@@ -228,23 +220,21 @@ def main():
                 fail += 1
                 fail_samples.append((dicom_path, out_png, msg))
 
-    print(f"[4/5] 写出项目 CSV: {out_csv_path}")
+    print(f"输出CSV: {out_csv_path}")
     out_df = pd.DataFrame.from_records(records)
     out_df.to_csv(out_csv_path, index=False)
 
-    print("[5/5] 完成汇总")
     print(f"PNG 输出目录: {out_img_root}")
-    print(f"项目 CSV: {out_csv_path}")
     print(f"转换成功: {ok}, 跳过已存在: {skipped}, 失败: {fail}")
 
     if fail_samples:
         fail_csv = out_root / "convert_failures.csv"
         pd.DataFrame(fail_samples, columns=["dicom_path", "out_png", "error"]).to_csv(fail_csv, index=False)
-        print(f"[WARN] 有失败样本，已写出失败清单: {fail_csv}")
+        print(f"[WARN] 有失败样本，已输出失败log: {fail_csv}")
         for r in fail_samples[:10]:
             print(f"[FAIL] dicom={r[0]} -> {r[1]} err={r[2]}")
 
-    print("\n训练提示（对应你原项目 online）：")
+    print("\n")
     print(f"  --data_dir {OUT_ROOT}")
     print(f"  --img_dir {IMG_DIR}")
     print(f"  --csv_file {OUT_CSV_NAME}")
