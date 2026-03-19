@@ -231,7 +231,9 @@ class Generic_MIL_Dataset(Dataset):
                     
         return {
         'x': x,
-        'y': torch.tensor(data[self.label], dtype=torch.long)
+        'y': torch.tensor(data[self.label], dtype=torch.long),
+        'patient_id': str(self.df.iloc[idx]['patient_id']) if 'patient_id' in self.df.columns else None,
+        'image_id': str(self.df.iloc[idx]['image_id']) if 'image_id' in self.df.columns else None
         }
             
 
@@ -256,7 +258,9 @@ def collate_MIL_patches(batch):
 
     return {
         'x': x, 
-        'y': torch.from_numpy(np.array([item["y"] for item in batch], dtype=np.float32))
+        'y': torch.from_numpy(np.array([item["y"] for item in batch], dtype=np.float32)),
+        'patient_id': [item['patient_id'] for item in batch],
+        'image_id': [item['image_id'] for item in batch]
     }
 
 
@@ -569,7 +573,6 @@ def collate_MIL_patches_detection(batch):
         'bag_info': [item['bag_info'] for item in batch],
         'boxes': np.vstack([item['boxes'] for item in batch])
     }
-
 
 
 

@@ -10,12 +10,12 @@ import torch
 
 from Datasets.dataset_utils import MIL_dataloader
 from MIL import build_model 
-from MIL.MIL_experiment import valid_fn
+from MIL.MIL_experiment import valid_fn, build_sample_results_df, resolve_checkpoint_path
 from utils.generic_utils import seed_all, print_network
 from utils.plot_utils import plot_confusion_matrix, ROC_curves
 from utils.data_split_utils import stratified_train_val_split
 
-def run_eval(run_path, args, device):
+def run_eval(checkpoint_path, args, device):
 
     if args.feature_extraction == 'online': 
         if 'efficientnetv2' in args.arch:
@@ -56,6 +56,11 @@ def run_eval(run_path, args, device):
     
     elif args.eval_set == 'test': # Use official test split
         test_df = args.df[args.df['split'] == "test"].reset_index(drop=True)
+    elif args.eval_set == 'all':
+        # Ignore split values and evaluate all rows from input CSV
+        test_df = args.df.reset_index(drop=True)
+    else:
+        raise ValueError(f"Unsupported eval_set: {args.eval_set}")
 
     # Create DataLoader for MIL evaluation on test set
     test_loader = MIL_dataloader(test_df ,'test', args)
@@ -68,13 +73,13 @@ def run_eval(run_path, args, device):
     print_network(model)
 
     # Load best model checkpoint
-    checkpoint = torch.load(os.path.join(run_path, 'best_model.pth'), map_location='cpu',weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu',weights_only=False)
     model.load_state_dict(checkpoint['model'], strict=False)
     
     # Set the model to evaluation mode
     model.eval()
 
-    test_targs, test_preds, test_probs, test_results = valid_fn(
+    test_targs, test_preds, test_probs, test_results, sample_results = valid_fn(
         test_loader, model, criterion = torch.nn.BCEWithLogitsLoss(reduction='mean'), args = args, device = device, split = 'test'
     )
     
@@ -91,7 +96,7 @@ def run_eval(run_path, args, device):
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    run_name = os.path.basename(run_path) 
+    run_name = checkpoint_path.parent.name 
     
     print(f"Saving ROC curve and Confusion Matrix to {output_path} ...")
     
@@ -128,7 +133,9 @@ def run_eval(run_path, args, device):
     # Create the final DataFrame
     df_final_results = pd.DataFrame(final_results_data, index=[0])
 
-    return df_final_results
+    sample_results_df = build_sample_results_df(test_df, sample_results, args.eval_set, args)
+
+    return df_final_results, sample_results_df
 
 
 def Eval(args, device):
@@ -140,16 +147,24 @@ def Eval(args, device):
         
         print(f'\nRunning eval for model run nº{run_idx + args.start_run}....')
         
-        #run_path = os.path.join(args.resume, f'run_{args.start_run + run_idx}')
-        run_path = os.path.join(args.resume, f'fold_{args.start_run + run_idx}')
+        checkpoint_path = resolve_checkpoint_path(args.resume, args.start_run + run_idx)
+        if checkpoint_path is None:
+            raise FileNotFoundError(
+                f"Could not find checkpoint for index {args.start_run + run_idx} under {args.resume}. "
+                "Expected run_i/best_model.pth, fold_i/best_model.pth, or a direct checkpoint file."
+            )
         
         # Run the evaluation and get results as DataFrame
-        run_results_df = run_eval(run_path, args, device) 
+        run_results_df, sample_results_df = run_eval(checkpoint_path, args, device) 
         
         # Add column to track the run
         run_results_df["runs"] = args.start_run + run_idx
+        sample_results_df["runs"] = args.start_run + run_idx
         
         all_results.append(run_results_df)
+        sample_output_path = os.path.join(args.output_dir, f'{args.dataset}_{args.eval_set}_predictions_run_{args.start_run + run_idx}.csv')
+        sample_results_df.to_csv(sample_output_path, index=False)
+        print(f"Sample-level predictions saved to {sample_output_path}")
     
     
 

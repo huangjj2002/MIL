@@ -21,6 +21,119 @@ from utils.training_setup_utils import initialize_training_setup, Training_Stage
 from utils.plot_utils import plot_loss_and_acc_curves, plot_lrs_scheduler, plot_confusion_matrix, ROC_curves
 from utils.data_split_utils import generator_cross_val_folds, stratified_train_val_split
 
+def resolve_checkpoint_path(resume_path, checkpoint_idx=None):
+    if resume_path is None:
+        return None
+
+    resume_path = Path(resume_path)
+
+    if resume_path.is_file():
+        return resume_path
+
+    if not resume_path.exists():
+        return None
+
+    candidate_paths = []
+
+    if checkpoint_idx is not None:
+        candidate_paths.extend([
+            resume_path / f'fold_{checkpoint_idx}' / 'best_model.pth',
+            resume_path / f'run_{checkpoint_idx}' / 'best_model.pth',
+        ])
+
+    candidate_paths.extend([
+        resume_path / 'best_model.pth',
+        resume_path / 'checkpoint.pth',
+    ])
+
+    for candidate_path in candidate_paths:
+        if candidate_path.exists():
+            return candidate_path
+
+    return None
+
+def get_class_names(args):
+    if args.label.lower() == 'mass':
+        return 'not_mass', 'mass'
+    if args.label.lower() == 'suspicious_calcification':
+        return 'not_calcification', 'calcification'
+    if args.label.lower() == 'cancer':
+        return 'not_cancer', 'cancer'
+    return 'negative', 'positive'
+
+def build_sample_results_df(df, sample_results, split_name, args):
+    sample_df = df.copy().reset_index(drop=True)
+
+    for column, values in sample_results.items():
+        if column in ['patient_id', 'image_id']:
+            continue
+        sample_df[column] = values
+
+    if args.mil_type == 'pyramidal_mil':
+        if 'score_aggregated' in sample_df.columns:
+            sample_df['score'] = sample_df['score_aggregated']
+        if 'pred_aggregated' in sample_df.columns:
+            sample_df['pred'] = sample_df['pred_aggregated']
+
+    label_col = args.label.lower()
+
+    if 'score' in sample_df.columns:
+        sample_df['prediction_score'] = sample_df['score'].astype(float)
+    else:
+        sample_df['prediction_score'] = np.nan
+
+    if 'pred' in sample_df.columns:
+        sample_df['predicted_class'] = sample_df['pred'].astype(float).round().astype(int)
+    else:
+        sample_df['predicted_class'] = (sample_df['prediction_score'] >= 0.5).astype(int)
+
+    if 'label' in sample_df.columns:
+        sample_df[label_col] = sample_df['label'].astype(float).round().astype(int)
+    elif label_col in sample_df.columns:
+        sample_df[label_col] = sample_df[label_col].astype(float).round().astype(int)
+    else:
+        sample_df[label_col] = np.nan
+
+    if 'cohert_num' not in sample_df.columns and 'cohort_num' in sample_df.columns:
+        sample_df['cohert_num'] = sample_df['cohort_num']
+
+    for required_col in ['patient_id', 'image_id', 'split', 'cohert_num']:
+        if required_col not in sample_df.columns:
+            sample_df[required_col] = None
+
+    # Keep only required export columns; runs is appended later in evaluation flow.
+    keep_cols = ['patient_id', 'image_id', 'split', 'cohert_num', label_col, 'prediction_score', 'predicted_class']
+    return sample_df[keep_cols]
+
+def predict_and_build_results(df, split_name, model, args, device):
+    loader = MIL_dataloader(df, 'test', args)
+    _, _, _, _, sample_results = valid_fn(
+        loader,
+        model,
+        criterion=torch.nn.BCEWithLogitsLoss(reduction='mean'),
+        args=args,
+        device=device,
+        split=split_name,
+        return_sample_results=True,
+    )
+    return build_sample_results_df(df, sample_results, split_name, args)
+
+def save_full_split_predictions(model, split_dfs, output_dir, file_stem, args, device):
+    prediction_frames = []
+
+    for split_name, split_df in split_dfs:
+        if split_df is None or len(split_df) == 0:
+            continue
+        prediction_frames.append(predict_and_build_results(split_df, split_name, model, args, device))
+
+    if prediction_frames:
+        predictions_df = pd.concat(prediction_frames, ignore_index=True)
+        if hasattr(args, 'checkpoint_index'):
+            predictions_df['runs'] = int(args.checkpoint_index)
+        output_path = Path(output_dir) / f'{file_stem}.csv'
+        predictions_df.to_csv(output_path, index=False)
+        print(f"Sample-level predictions saved to {output_path}")
+
 def do_experiments(args, device):
         
     args.n_class = 1 # Binary classification setup (single output neuron)
@@ -89,6 +202,7 @@ def do_experiments(args, device):
         for idx_run in range(args.n_runs):
             print(f'\n================== run nº: {idx_run} ======================')
             args.cur_fold = idx_run  
+            args.checkpoint_index = args.start_run + idx_run
 
             # set seed for reproducibility
             seed_all(args.seed+args.start_run+idx_run)
@@ -105,10 +219,20 @@ def do_experiments(args, device):
             fold_model = build_model(args)
             fold_model.load_state_dict(checkpoint['model'])
             fold_model.to(device)
+            fold_model.eval()
 
             # evaluate model on test set
-            test_targs, test_preds, test_probs, test_results = valid_fn(
+            test_targs, test_preds, test_probs, test_results, _ = valid_fn(
                 test_loader, fold_model, criterion = torch.nn.BCEWithLogitsLoss(reduction='mean'), args = args, device = device, split = 'test')
+
+            save_full_split_predictions(
+                fold_model,
+                [('train', train_df), ('val', val_df), ('test', test_df)],
+                path_results_run,
+                f'{args.dataset}_all_predictions_run_{args.start_run + idx_run}',
+                args,
+                device,
+            )
 
             # free GPU memory
             del fold_model; clear_memory()
@@ -254,6 +378,7 @@ def do_experiments(args, device):
             print(f'\n================== fold: {fold} training ======================')
             
             args.cur_fold = fold
+            args.checkpoint_index = fold
             seed_all(args.seed)
 
             # Setup path for the current fold's results 
@@ -290,11 +415,20 @@ def do_experiments(args, device):
             fold_model = build_model(args)
             fold_model.load_state_dict(checkpoint['model'])
             fold_model.to(device)
+            fold_model.eval()
 
+            save_full_split_predictions(
+                fold_model,
+                [('train', train_df), ('val', val_df), ('test', test_df)],
+                path_results_fold,
+                f'{args.dataset}_all_predictions_fold_{fold}',
+                args,
+                device,
+            )
 
             if test_loader is not None:
                 # Evaluate on test set
-                test_targs, test_preds, test_probs, test_results = valid_fn(
+                test_targs, test_preds, test_probs, test_results, _ = valid_fn(
                     test_loader, fold_model, criterion=torch.nn.BCEWithLogitsLoss(reduction='mean'), args=args, device=device, split='test')
 
                 # Log test results
@@ -415,9 +549,10 @@ def k_experiment(train_df, val_df, output_path, args, device):
 
     # Build and load model
     model = build_model(args)
-    if args.resume and os.path.exists(args.resume):
-        print(f"Loading checkpoint for fine-tuning from: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location='cpu',weights_only=False)
+    checkpoint_path = resolve_checkpoint_path(args.resume, getattr(args, 'checkpoint_index', None))
+    if checkpoint_path is not None:
+        print(f"Loading checkpoint for fine-tuning from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu',weights_only=False)
         
         msg = model.load_state_dict(checkpoint['model'], strict=False)
         print(f"Checkpoint loaded. Message: {msg}")
@@ -787,7 +922,7 @@ def train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, 
     return train_stats 
 
 @torch.no_grad()
-def valid_fn(valid_loader, model, criterion, args, device, split = 'val', epoch=1):
+def valid_fn(valid_loader, model, criterion, args, device, split = 'val', epoch=1, return_sample_results=False):
     
     model.eval() # Set model to evaluation mode
     model.is_training = False 
@@ -795,6 +930,8 @@ def valid_fn(valid_loader, model, criterion, args, device, split = 'val', epoch=
     losses = AverageMeter() 
 
     targs = []
+    sample_patient_ids = []
+    sample_image_ids = []
 
     if args.mil_type == 'pyramidal_mil':
         preds = {}
@@ -839,6 +976,8 @@ def valid_fn(valid_loader, model, criterion, args, device, split = 'val', epoch=
             batch_size = inputs.size(0)
 
         labels = data['y'].float().to(device)
+        sample_patient_ids.extend(data.get('patient_id', [None] * batch_size))
+        sample_image_ids.extend(data.get('image_id', [None] * batch_size))
         
         # Wrap forward pass with autocast
         with torch.cuda.amp.autocast(enabled=args.apex):
@@ -942,6 +1081,10 @@ def valid_fn(valid_loader, model, criterion, args, device, split = 'val', epoch=
 
     targs = np.concatenate(targs)
 
+    # Preserve raw sample-wise predictions/probabilities before metric aggregation
+    sample_preds_raw = preds
+    sample_probs_raw = probs
+
     # Compute and store metrics depending on MIL model type
     if args.mil_type == 'pyramidal_mil':
 
@@ -979,7 +1122,27 @@ def valid_fn(valid_loader, model, criterion, args, device, split = 'val', epoch=
         
         val_stats.update({'auc_roc': aucroc, 'bacc': bacc, 'f1': f1, 'cf_matrix': cf_matrix})
     
-    if split == 'test': 
-        return targs, preds, probs, val_stats
+    if split == 'test' or return_sample_results: 
+        sample_results = {
+            'patient_id': sample_patient_ids,
+            'image_id': sample_image_ids,
+            'label': targs.tolist() if isinstance(targs, np.ndarray) else list(targs),
+        }
+
+        if args.mil_type == 'pyramidal_mil':
+            if isinstance(sample_preds_raw, dict) and isinstance(sample_probs_raw, dict):
+                for key, value in sample_preds_raw.items():
+                    pred_values = np.concatenate(value) if isinstance(value, list) else np.asarray(value)
+                    sample_results[f'pred_{key}'] = pred_values.reshape(-1).tolist()
+                for key, value in sample_probs_raw.items():
+                    score_values = np.concatenate(value) if isinstance(value, list) else np.asarray(value)
+                    sample_results[f'score_{key}'] = score_values.reshape(-1).tolist()
+        else:
+            pred_values = np.concatenate(sample_preds_raw) if isinstance(sample_preds_raw, list) else np.asarray(sample_preds_raw)
+            score_values = np.concatenate(sample_probs_raw) if isinstance(sample_probs_raw, list) else np.asarray(sample_probs_raw)
+            sample_results['pred'] = pred_values.reshape(-1).tolist()
+            sample_results['score'] = score_values.reshape(-1).tolist()
+
+        return targs, preds, probs, val_stats, sample_results
 
     return val_stats 

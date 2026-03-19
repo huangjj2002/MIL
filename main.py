@@ -30,7 +30,7 @@ def config():
 
     parser.add_argument('--train', action='store_true', default=False, help='Training mode.')
     parser.add_argument('--evaluation', action='store_true', default=False, help='Evaluation mode.')
-    parser.add_argument('--eval_set', default='test', choices = ['val', 'test'], type=str, help="")
+    parser.add_argument('--eval_set', default='test', choices = ['val', 'test', 'all'], type=str, help="Evaluation split: val, test, or all (ignore split column).")
     
     # Data settings
     parser.add_argument("--img-size", nargs='+', default=[1520, 912])
