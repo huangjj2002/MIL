@@ -56,30 +56,30 @@
 
    #评估命令
    python main.py \
-  --evaluation \
-  --eval_set "all" \
-  --resume "./models" \
-  --clip_chk_pt_path "models/b2-model-best-epoch-10.tar" \
-  --data_dir "/mnt/f/data" \
-  --img_dir "images_png" \
-  --csv_file "train_with_test_data.csv" \
-  --dataset "ViNDr" \
-  --label "cancer" \
-  --feature_extraction "online" \
-  --mil_type "pyramidal_mil" \
-  --multi_scale_model "fpn" \
-  --fpn_dim 256 \
-  --fcl_encoder_dim 256 \
-  --fcl_dropout 0.25 \
-  --pooling_type "gated-attention" \
-  --drop_attention_pool 0.25 \
-  --type_scale_aggregator "gated-attention" \
-  --deep_supervision \
-  --scales 16 32 128 \
-  --batch-size 1 \
-  --output_dir "result_eval" \
-  --n_runs 1 \
-  --gpu_id 0
+     --evaluation \
+     --eval_set "all" \
+     --resume "./models" \
+     --clip_chk_pt_path "models/b2-model-best-epoch-10.tar" \
+     --data_dir "/mnt/f/data" \
+     --img_dir "images_png" \
+     --csv_file "train_with_test_data.csv" \
+     --dataset "ViNDr" \
+     --label "cancer" \
+     --feature_extraction "online" \
+     --mil_type "pyramidal_mil" \
+     --multi_scale_model "fpn" \
+     --fpn_dim 256 \
+     --fcl_encoder_dim 256 \
+     --fcl_dropout 0.25 \
+     --pooling_type "gated-attention" \
+     --drop_attention_pool 0.25 \
+     --type_scale_aggregator "gated-attention" \
+     --deep_supervision \
+     --scales 16 32 128 \
+     --batch-size 1 \
+     --output_dir "result_eval" \
+     --n_runs 1 \
+     --gpu_id 0
 
 
    ```
