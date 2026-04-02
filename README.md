@@ -55,6 +55,7 @@
 
 
    #评估命令
+
    python main.py \
   --evaluation \
   --eval_set "all" \
@@ -81,6 +82,7 @@
   --n_runs 5 \
   --start_run 0 \
   --gpu_id 0
+
    ```
    data_dir,img_dir,csv_file分别指向EMBED数据根目录，图片根目录以及csv文件的路径。EMBED数据根目录下应该包含图片根目录以及csv文件路径。output_dir指向模型的输出路径，将训练后得到的fold_0,fold_1,...,fold_4的模型权重放入models中，运行评估命令，修改output_dir更改输出目录.
    
