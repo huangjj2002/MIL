@@ -13,7 +13,7 @@ from MIL import build_model
 from MIL.MIL_experiment import valid_fn, build_sample_results_df, resolve_checkpoint_path
 from utils.generic_utils import seed_all, print_network
 from utils.plot_utils import plot_confusion_matrix, ROC_curves
-from utils.data_split_utils import stratified_train_val_split
+from utils.data_split_utils import split_df_by_cohorts, stratified_train_val_split
 
 def run_eval(checkpoint_path, args, device):
 
@@ -50,12 +50,19 @@ def run_eval(checkpoint_path, args, device):
     print(f"df shape: {args.df.shape}")
     print(args.df.columns)
 
-    if args.eval_set == 'val': 
-        dev_df = args.df[args.df['split'] == "training"].reset_index(drop=True)
-        _, test_df = stratified_train_val_split(dev_df, 0.2, args = args)
+    _, train_df, test_df = split_df_by_cohorts(
+        args.df,
+        train_cohorts=args.train_cohorts,
+        test_cohorts=args.test_cohorts,
+    )
+
+    if args.eval_set == 'val':
+        if getattr(args, 'n_folds', 0) <= 0:
+            raise ValueError("eval_set='val' requires an internal validation split. Set n_folds > 0.")
+        _, test_df = stratified_train_val_split(train_df, args.val_split, args=args)
     
-    elif args.eval_set == 'test': # Use official test split
-        test_df = args.df[args.df['split'] == "test"].reset_index(drop=True)
+    elif args.eval_set == 'test': # Use held-out test cohorts
+        test_df = test_df.reset_index(drop=True)
     elif args.eval_set == 'all':
         # Ignore split values and evaluate all rows from input CSV
         test_df = args.df.reset_index(drop=True)

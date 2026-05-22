@@ -118,7 +118,7 @@ dependencies:
       - tokenizers==0.20.3
       - torch==2.4.1
       - torchaudio==2.4.1
-      - torchvision==0.19.1a0
+      - torchvision==0.19.1
       - tqdm==4.67.1
       - transformers==4.45.2
       - typer-slim==0.21.1

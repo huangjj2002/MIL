@@ -19,7 +19,11 @@ from utils.metrics import auroc, evaluate_metrics
 from utils.generic_utils import seed_all, AverageMeter, timeSince, print_network, clear_memory 
 from utils.training_setup_utils import initialize_training_setup, Training_Stage_Config
 from utils.plot_utils import plot_loss_and_acc_curves, plot_lrs_scheduler, plot_confusion_matrix, ROC_curves
-from utils.data_split_utils import generator_cross_val_folds, stratified_train_val_split
+from utils.data_split_utils import (
+    generator_cross_val_folds,
+    split_df_by_cohorts,
+    stratified_train_val_split,
+)
 
 def resolve_checkpoint_path(resume_path, checkpoint_idx=None):
     if resume_path is None:
@@ -94,15 +98,16 @@ def build_sample_results_df(df, sample_results, split_name, args):
     else:
         sample_df[label_col] = np.nan
 
-    if 'cohert_num' not in sample_df.columns and 'cohort_num' in sample_df.columns:
-        sample_df['cohert_num'] = sample_df['cohort_num']
+    sample_df['split'] = split_name
+    if 'cohort_num' not in sample_df.columns and 'cohert_num' in sample_df.columns:
+        sample_df['cohort_num'] = sample_df['cohert_num']
 
-    for required_col in ['patient_id', 'image_id', 'split', 'cohert_num']:
+    for required_col in ['patient_id', 'image_id', 'split', 'cohort_num']:
         if required_col not in sample_df.columns:
             sample_df[required_col] = None
 
     # Keep only required export columns; runs is appended later in evaluation flow.
-    keep_cols = ['patient_id', 'image_id', 'split', 'cohert_num', label_col, 'prediction_score', 'predicted_class']
+    keep_cols = ['patient_id', 'image_id', 'split', 'cohort_num', label_col, 'prediction_score', 'predicted_class']
     return sample_df[keep_cols]
 
 def predict_and_build_results(df, split_name, model, args, device):
@@ -160,19 +165,31 @@ def do_experiments(args, device):
     print(f"df shape: {args.df.shape}")
     print(args.df.columns)
 
-    # Split data into dev (train+val) and test sets
-    dev_df = args.df[args.df['split'] == "training"].reset_index(drop=True)
-    test_df = args.df[args.df['split'] == "test"].reset_index(drop=True)
+    _, dev_df, test_df = split_df_by_cohorts(
+        args.df,
+        train_cohorts=args.train_cohorts,
+        test_cohorts=args.test_cohorts,
+    )
 
     # reduce dataset size for debugging/experiments if desired
     if args.data_frac < 1.0:
         dev_df = dev_df.sample(frac=args.data_frac, random_state=1, ignore_index=True) 
 
+    if args.eval_scheme == 'kfold_cv+test' and args.n_folds == 0:
+        print("[Auto-Config] n_folds=0 detected. Falling back to single train/test run without internal cross-validation.")
+        args.eval_scheme = 'kruns_train+val+test'
+        args.n_runs = 1
+
     # repeated k runs using fixed data splits 
     if args.eval_scheme == 'kruns_train+val+test': 
+        use_test_as_validation = args.n_folds == 0
 
         # split development set into training and validation sets
-        train_df, val_df = stratified_train_val_split(dev_df, 0.2, args = args)
+        if use_test_as_validation:
+            train_df = dev_df.reset_index(drop=True)
+            val_df = test_df.reset_index(drop=True)
+        else:
+            train_df, val_df = stratified_train_val_split(dev_df, args.val_split, args=args)
 
         # initialize results dictionary based on model type
         if args.multi_scale_model is not None: 
@@ -212,7 +229,14 @@ def do_experiments(args, device):
             Path(path_results_run).mkdir(parents=True, exist_ok=True)
 
             # train and validate model
-            val_results, best_checkpoint_path = k_experiment(train_df, val_df, output_path= path_results_run, args = args, device = device)
+            val_results, best_checkpoint_path = k_experiment(
+                train_df,
+                val_df,
+                output_path=path_results_run,
+                args=args,
+                device=device,
+                valid_split_name='test' if use_test_as_validation else 'val',
+            )
 
             # load the best model checkpoint
             checkpoint = torch.load(best_checkpoint_path, map_location='cpu',weights_only=False)
@@ -227,7 +251,7 @@ def do_experiments(args, device):
 
             save_full_split_predictions(
                 fold_model,
-                [('train', train_df), ('val', val_df), ('test', test_df)],
+                [('train', train_df), ('test', test_df)] if use_test_as_validation else [('train', train_df), ('val', val_df), ('test', test_df)],
                 path_results_run,
                 f'{args.dataset}_all_predictions_run_{args.start_run + idx_run}',
                 args,
@@ -344,7 +368,10 @@ def do_experiments(args, device):
             test_results_data = pd.concat([test_results_data, test_mean_std]).reset_index(drop=True)
 
         # Combine validation and test results
-        metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
+        if use_test_as_validation:
+            metrics_data = pd.concat([test_results_data], keys=['test'], names=['split', 'index'])
+        else:
+            metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
         metrics_data = metrics_data.reset_index(level='split') # Reset index to turn the keys into columns
         metrics_data.to_csv(args.output_path / 'results_summary.csv', index=False)
 
@@ -352,7 +379,12 @@ def do_experiments(args, device):
     elif args.eval_scheme == 'kfold_cv+test':
 
         # Generate k-fold cross-validation splits 
-        train_val_splits = generator_cross_val_folds(dev_df, args.n_folds, args.label) 
+        train_val_splits = generator_cross_val_folds(
+            dev_df,
+            args.n_folds,
+            args.label,
+            random_state=args.seed,
+        ) 
 
         # Initialize result dictionaries 
         all_val_results = {scale: {'f1': [], 'bacc': [], 'auc_roc': []} for scale in args.scales}
@@ -520,7 +552,7 @@ def do_experiments(args, device):
             
         metrics_data = metrics_data.reset_index(level='split') # Reset index to turn the keys into columns
         metrics_data.to_csv(args.output_path / 'results_summary.csv', index=False)
-def k_experiment(train_df, val_df, output_path, args, device): 
+def k_experiment(train_df, val_df, output_path, args, device, valid_split_name='val'): 
     """
     Executes a single train/validation experiment.
     
@@ -544,7 +576,7 @@ def k_experiment(train_df, val_df, output_path, args, device):
 
     # Initialize data loaders
     train_loader = MIL_dataloader(train_df, 'train', args)
-    valid_loader = MIL_dataloader(val_df ,'val', args)
+    valid_loader = MIL_dataloader(val_df, valid_split_name, args)
     print(f'train_loader: {len(train_loader)}, valid_loader: {len(valid_loader)}')
 
     # Build and load model
@@ -566,12 +598,26 @@ def k_experiment(train_df, val_df, output_path, args, device):
 
     optimizer, scheduler, scaler, train_criterion, eval_criterion = initialize_training_setup(train_loader, model, device, args)
 
-    best_val_stats, best_model = train_loop(train_loader, valid_loader, model, training_stage_manager, train_criterion, eval_criterion, optimizer, scheduler, scaler, output_path, args, device)
+    best_val_stats, best_model = train_loop(
+        train_loader,
+        valid_loader,
+        model,
+        training_stage_manager,
+        train_criterion,
+        eval_criterion,
+        optimizer,
+        scheduler,
+        scaler,
+        output_path,
+        args,
+        device,
+        valid_split_name=valid_split_name,
+    )
     
     return best_val_stats, best_model
     
 
-def train_loop(train_loader, valid_loader, model, training_stage_manager, train_criterion, eval_criterion, optimizer, scheduler, scaler, output_path, args, device):
+def train_loop(train_loader, valid_loader, model, training_stage_manager, train_criterion, eval_criterion, optimizer, scheduler, scaler, output_path, args, device, valid_split_name='val'):
 
     best_aucroc = 0.
     best_epoch = 0 
@@ -593,9 +639,11 @@ def train_loop(train_loader, valid_loader, model, training_stage_manager, train_
         train_stats = train_fn(train_loader, model, train_criterion, optimizer, epoch, args, scheduler, scaler, device)
 
         # validation after the epoch
-        val_stats = valid_fn(valid_loader, model, eval_criterion, args, device, split = 'val', epoch = epoch)
+        val_stats = valid_fn(valid_loader, model, eval_criterion, args, device, split=valid_split_name, epoch=epoch)
     
         elapsed = time.time() - start_time
+
+        valid_display_name = 'Test' if valid_split_name == 'test' else 'Val'
 
         # If using multi-scale model, report scale-specific and aggregated results
         if args.multi_scale_model is not None: 
@@ -607,13 +655,13 @@ def train_loop(train_loader, valid_loader, model, training_stage_manager, train_
                 
             print(f"Aggregated Results --> Train F1-Score: {train_stats['aggregated']['f1']:.4f} | Train Bacc: {train_stats['aggregated']['bacc']:.4f} | Train ROC-AUC: {train_stats['aggregated']['auc_roc']:.4f}")
         
-            print(f"\nVal Loss: {val_stats['loss']:.4f}") 
+            print(f"\n{valid_display_name} Loss: {val_stats['loss']:.4f}") 
 
             if (args.type_scale_aggregator in ['concatenation', 'gated-attention'] and args.deep_supervision) or args.type_scale_aggregator in ['max_p', 'mean_p']: 
                 for s in args.scales:
-                    print(f"Scale: {s} --> Val F1-Score: {val_stats[s]['f1']:.4f} | Val Bacc: {val_stats[s]['bacc']:.4f} | Val ROC-AUC: {val_stats[s]['auc_roc']:.4f}")            
+                    print(f"Scale: {s} --> {valid_display_name} F1-Score: {val_stats[s]['f1']:.4f} | {valid_display_name} Bacc: {val_stats[s]['bacc']:.4f} | {valid_display_name} ROC-AUC: {val_stats[s]['auc_roc']:.4f}")            
             
-            print(f"Aggregated Results --> Val F1-Score: {val_stats['aggregated']['f1']:.4f} | Val Bacc: {val_stats['aggregated']['bacc']:.4f} | Val ROC-AUC: {val_stats['aggregated']['auc_roc']:.4f}")
+            print(f"Aggregated Results --> {valid_display_name} F1-Score: {val_stats['aggregated']['f1']:.4f} | {valid_display_name} Bacc: {val_stats['aggregated']['bacc']:.4f} | {valid_display_name} ROC-AUC: {val_stats['aggregated']['auc_roc']:.4f}")
         
             # Update results dictionary
             train_results['loss'].append(train_stats['loss'])
@@ -656,7 +704,7 @@ def train_loop(train_loader, valid_loader, model, training_stage_manager, train_
 
             print(f"\nTrain Loss: {train_stats['loss']:.4f} | Train F1-Score: {train_stats['f1']:.4f} | Train Bacc: {train_stats['bacc']:.4f} | Train ROC-AUC: {train_stats['auc_roc']:.4f}")
             
-            print(f"\nVal Loss: {val_stats['loss']:.4f} | Val F1-Score: {val_stats['f1']:.4f} | Val. Bacc: {val_stats['bacc']:.4f} | Val ROC-AUC: {val_stats['auc_roc']:.4f}\n")
+            print(f"\n{valid_display_name} Loss: {val_stats['loss']:.4f} | {valid_display_name} F1-Score: {val_stats['f1']:.4f} | {valid_display_name} Bacc: {val_stats['bacc']:.4f} | {valid_display_name} ROC-AUC: {val_stats['auc_roc']:.4f}\n")
         
             # Update results dictionary
             train_results['loss'].append(train_stats['loss'])

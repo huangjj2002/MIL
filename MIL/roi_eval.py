@@ -3,7 +3,7 @@ from Datasets.dataset_utils import MIL_dataloader, Generic_MIL_Dataset, collate_
 from MIL import build_model 
 from MIL.MIL_experiment import valid_fn
 from utils.generic_utils import seed_all, clear_memory, print_network 
-from utils.data_split_utils import stratified_train_val_split
+from utils.data_split_utils import split_df_by_cohorts, stratified_train_val_split
 
 # external imports 
 from torch.utils.data import DataLoader
@@ -987,12 +987,18 @@ def run_roi_eval(directory, args, device):
     args.df = args.df.fillna(0)
     
     if args.dataset == 'ViNDr':
+        _, train_df, test_df = split_df_by_cohorts(
+            args.df,
+            train_cohorts=args.train_cohorts,
+            test_cohorts=args.test_cohorts,
+        )
         if args.roi_eval_set == 'val': 
-            dev_df = args.df[args.df['split'] == "training"].reset_index(drop=True)
-            _, test_df = stratified_train_val_split(dev_df, 0.2, args = args)
+            if getattr(args, 'n_folds', 0) <= 0:
+                raise ValueError("roi_eval_set='val' requires an internal validation split. Set n_folds > 0.")
+            _, test_df = stratified_train_val_split(train_df, args.val_split, args=args)
     
         elif args.roi_eval_set == 'test': 
-            test_df = args.df[args.df['split'] == "test"].reset_index(drop=True)
+            test_df = test_df.reset_index(drop=True)
 
     dataloader = MIL_dataloader(test_df ,'test', args)
 
@@ -1332,4 +1338,3 @@ def ROI_Eval(args, device):
     
 
     
-

@@ -61,7 +61,7 @@
    --eval_set "all" \
    --resume "./models" \
    --clip_chk_pt_path "models/b2-model-best-epoch-10.tar" \
-   --data_dir "/mnt/f/data" \
+   --data_dir "/mnt/g/data" \
    --img_dir "images_png" \
    --csv_file "train_with_test_data.csv" \
    --dataset "ViNDr" \
@@ -79,7 +79,7 @@
    --scales 16 32 128 \
    --batch-size 1 \
    --output_dir "result_eval" \
-   --n_runs 5 \
+   --n_runs 1 \
    --start_run 0 \
    --gpu_id 0
    ```

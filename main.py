@@ -43,6 +43,20 @@ def config():
     parser.add_argument('--val_split', type=float, default=0.2, help='val split ratio (default: 0.2)')
     parser.add_argument("--n_folds", default=1, type=int)
     parser.add_argument("--start-fold", default=0, type=int)
+    parser.add_argument(
+        "--train-cohorts", "--train_cohorts",
+        dest="train_cohorts",
+        default="1-8",
+        type=str,
+        help="Cohorts to use for training / cross-validation, e.g. '1-8' or '1,2,3'.",
+    )
+    parser.add_argument(
+        "--test-cohorts", "--test_cohorts",
+        dest="test_cohorts",
+        default="9-10",
+        type=str,
+        help="Cohorts to use for held-out testing, e.g. '9-10' or '9,10'.",
+    )
     parser.add_argument("--mean", default=0.3089279, type=float)
     parser.add_argument("--std", default=0.25053555408335154, type=float)
 
@@ -166,6 +180,7 @@ def config():
 def main(args):
     import os
     import torch
+    from utils.data_split_utils import split_df_by_cohorts
     from utils.generic_utils import seed_all
     from MIL.MIL_experiment import do_experiments
     from MIL.roi_eval import ROI_Eval
@@ -196,17 +211,22 @@ def main(args):
         args.df = pd.read_csv(args.data_dir / args.csv_file)
         args.df = args.df.fillna(0)
 
+        _, train_split_df, _ = split_df_by_cohorts(
+            args.df,
+            train_cohorts=args.train_cohorts,
+            test_cohorts=args.test_cohorts,
+        )
 
         if args.weighted_BCE == "y":
-            num_pos = args.df[args.label].sum()
-            num_neg = len(args.df) - num_pos
+            num_pos = train_split_df[args.label].sum()
+            num_neg = len(train_split_df) - num_pos
             
             if num_pos > 0:
                 args.BCE_weights = float(num_neg / num_pos)
             else:
                 args.BCE_weights = 1.0
             
-            print(f"\n[Auto-Config] Data Split: Using ALL data.")
+            print(f"\n[Auto-Config] Cohort train split: {args.train_cohorts}")
             print(f"[Auto-Config] Label: {args.label}")
             print(f"[Auto-Config] Stats: Neg={int(num_neg)}, Pos={int(num_pos)}")
             print(f"[Auto-Config] Calculated new BCE_weight: {args.BCE_weights:.4f}\n")
