@@ -120,6 +120,10 @@ def config():
     parser.add_argument("--epochs", default=9, type=int)
     parser.add_argument("--weight-decay", default=1e-4, type=float)
     parser.add_argument("--weighted-BCE", default='n', type=str)
+    parser.add_argument("--early_stop_patience", default=0, type=int,
+                        help="Early stopping patience in epochs. Set > 0 to enable; 0 disables early stopping.")
+    parser.add_argument("--early_stop_min_delta", default=0.0, type=float,
+                        help="Minimum validation metric improvement required to reset early stopping.")
     parser.add_argument('--clip_grad', type=float, default=0.0, metavar='NORM',
                    help='Clip gradient norm (default: None, no clipping)')
 

@@ -133,11 +133,58 @@ def save_full_split_predictions(model, split_dfs, output_dir, file_stem, args, d
 
     if prediction_frames:
         predictions_df = pd.concat(prediction_frames, ignore_index=True)
+        if hasattr(args, 'cur_fold'):
+            predictions_df['fold'] = int(args.cur_fold)
         if hasattr(args, 'checkpoint_index'):
             predictions_df['runs'] = int(args.checkpoint_index)
         output_path = Path(output_dir) / f'{file_stem}.csv'
         predictions_df.to_csv(output_path, index=False)
         print(f"Sample-level predictions saved to {output_path}")
+
+def save_mil_loss_curve(train_results, val_results, output_path):
+    """Save epoch-wise MIL loss history in the same shape as EDL curves."""
+    if not train_results['loss'] or not val_results['loss']:
+        return
+
+    output_path = Path(output_path)
+    curve_df = pd.DataFrame({
+        'epoch': np.arange(1, len(train_results['loss']) + 1),
+        'train_loss': train_results['loss'],
+        'val_loss': val_results['loss'],
+        'train_auc_roc': train_results['auc_roc'],
+        'val_auc_roc': val_results['auc_roc'],
+        'train_f1': train_results['f1'],
+        'val_f1': val_results['f1'],
+        'train_bacc': train_results['bacc'],
+        'val_bacc': val_results['bacc'],
+        'lr': train_results['lr'],
+    })
+    curve_df.to_csv(output_path / 'mil_loss_curve.csv', index=False)
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(curve_df['epoch'], curve_df['train_loss'], marker='o', label='Train Loss')
+        ax.plot(curve_df['epoch'], curve_df['val_loss'], marker='o', label='Val Loss')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('MIL Loss Curve')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(output_path / 'mil_loss_curve.png', dpi=200)
+        plt.close(fig)
+    except Exception as exc:
+        print(f"[MIL] Warning: failed to save loss curve plot: {exc}")
+
+def get_primary_stats(stats, args):
+    """Return the aggregated branch metrics when using a multi-scale model."""
+    if args.multi_scale_model is not None:
+        return stats['aggregated']
+    return stats
 
 def do_experiments(args, device):
         
@@ -176,9 +223,7 @@ def do_experiments(args, device):
         dev_df = dev_df.sample(frac=args.data_frac, random_state=1, ignore_index=True) 
 
     if args.eval_scheme == 'kfold_cv+test' and args.n_folds == 0:
-        print("[Auto-Config] n_folds=0 detected. Falling back to single train/test run without internal cross-validation.")
-        args.eval_scheme = 'kruns_train+val+test'
-        args.n_runs = 1
+        print("[Auto-Config] n_folds=0 detected. Using train cohorts for training and test cohorts for validation.")
 
     # repeated k runs using fixed data splits 
     if args.eval_scheme == 'kruns_train+val+test': 
@@ -378,162 +423,216 @@ def do_experiments(args, device):
 
     elif args.eval_scheme == 'kfold_cv+test':
 
-        # Generate k-fold cross-validation splits 
-        train_val_splits = generator_cross_val_folds(
-            dev_df,
-            args.n_folds,
-            args.label,
-            random_state=args.seed,
-        ) 
-
-        # Initialize result dictionaries 
-        all_val_results = {scale: {'f1': [], 'bacc': [], 'auc_roc': []} for scale in args.scales}
-        all_val_results['aggregated'] = {'f1': [], 'bacc': [], 'auc_roc': []}
-
-        all_test_results = {scale: {'f1': [], 'bacc': [], 'auc_roc': []} for scale in args.scales}
-        all_test_results['aggregated'] = {'f1': [], 'bacc': [], 'auc_roc': []}
-
-        # initialize test dataloader 
-        # initialize test dataloader 
-        if len(test_df) > 0:
-            test_loader = MIL_dataloader(test_df ,'test', args)
+        use_test_as_validation = args.n_folds == 0
+        if use_test_as_validation:
+            split_iter = [(0, (dev_df.reset_index(drop=True), test_df.reset_index(drop=True)))]
+            total_folds = 1
         else:
-            test_loader = None
-        
-        checkpoint_folds = []
+            split_iter = enumerate(
+                generator_cross_val_folds(
+                    dev_df,
+                    args.n_folds,
+                    args.label,
+                    random_state=args.seed,
+                )
+            )
+            total_folds = args.n_folds
 
+        track_side_results = (
+            args.multi_scale_model is not None
+            and (
+                (args.type_scale_aggregator in ['concatenation', 'gated-attention'] and args.deep_supervision)
+                or args.type_scale_aggregator in ['max_p', 'mean_p']
+            )
+        )
 
+        if args.multi_scale_model is not None:
+            all_val_results = {scale: {'f1': [], 'bacc': [], 'auc_roc': []} for scale in args.scales} if track_side_results else {}
+            all_test_results = {scale: {'f1': [], 'bacc': [], 'auc_roc': []} for scale in args.scales} if track_side_results else {}
+            all_val_results['aggregated'] = {'f1': [], 'bacc': [], 'auc_roc': []}
+            all_test_results['aggregated'] = {'f1': [], 'bacc': [], 'auc_roc': []}
+        else:
+            all_val_results = {'f1': [], 'bacc': [], 'auc_roc': []}
+            all_test_results = {'f1': [], 'bacc': [], 'auc_roc': []}
 
-        # Iterate through each fold
-        for fold in range(args.start_fold, args.n_folds):
+        test_loader = MIL_dataloader(test_df, 'test', args) if len(test_df) > 0 else None
+        evaluated_folds = []
+        fold_summaries = []
+        fold_assignments = []
 
-            print(f'\n================== fold: {fold} training ======================')
-            
+        def append_results(store, stats):
+            if args.multi_scale_model is not None:
+                if track_side_results:
+                    for scale in args.scales:
+                        store[scale]['f1'].append(stats[scale]['f1'])
+                        store[scale]['bacc'].append(stats[scale]['bacc'])
+                        store[scale]['auc_roc'].append(stats[scale]['auc_roc'])
+                primary_stats = stats['aggregated']
+                store['aggregated']['f1'].append(primary_stats['f1'])
+                store['aggregated']['bacc'].append(primary_stats['bacc'])
+                store['aggregated']['auc_roc'].append(primary_stats['auc_roc'])
+            else:
+                store['f1'].append(stats['f1'])
+                store['bacc'].append(stats['bacc'])
+                store['auc_roc'].append(stats['auc_roc'])
+
+        def print_split_results(split_name, stats):
+            print(f"\n{split_name} Loss: {stats['loss']:.4f}")
+            if args.multi_scale_model is not None:
+                if track_side_results:
+                    for scale in args.scales:
+                        print(
+                            f"Scale: {scale} --> {split_name} F1-Score: {stats[scale]['f1']:.4f} | "
+                            f"{split_name} Bacc: {stats[scale]['bacc']:.4f} | "
+                            f"{split_name} ROC-AUC: {stats[scale]['auc_roc']:.4f}"
+                        )
+                primary_stats = stats['aggregated']
+                print(
+                    f"Aggregated Results --> {split_name} F1-Score: {primary_stats['f1']:.4f} | "
+                    f"{split_name} Bacc: {primary_stats['bacc']:.4f} | "
+                    f"{split_name} ROC-AUC: {primary_stats['auc_roc']:.4f}"
+                )
+            else:
+                print(
+                    f"{split_name} F1-Score: {stats['f1']:.4f} | "
+                    f"{split_name} Bacc: {stats['bacc']:.4f} | "
+                    f"{split_name} ROC-AUC: {stats['auc_roc']:.4f}"
+                )
+
+        for fold, (train_df, val_df) in split_iter:
+            if fold < args.start_fold:
+                continue
+
+            print(f'\n================== fold: {fold} / {total_folds} training ======================')
+
             args.cur_fold = fold
             args.checkpoint_index = fold
-            seed_all(args.seed)
+            seed_all(args.seed + fold)
 
-            # Setup path for the current fold's results 
             path_results_fold = args.output_path / f'fold_{fold}'
             Path(path_results_fold).mkdir(parents=True, exist_ok=True)
 
-            # Get the next train/val split
-            train_df, val_df = next(train_val_splits)
+            valid_split_name = 'test' if use_test_as_validation else 'val'
+            print(f"Train: {len(train_df)}, {valid_split_name.capitalize()}: {len(val_df)}")
 
-            # Train and evaluate on val set
-            val_results, best_checkpoint_path = k_experiment(train_df, val_df, path_results_fold, args, device)
+            val_results, best_checkpoint_path = k_experiment(
+                train_df,
+                val_df,
+                path_results_fold,
+                args,
+                device,
+                valid_split_name=valid_split_name,
+            )
 
-            # Log validation results
-            print(f"\nVal Loss: {val_results['loss']:.4f}")        
-            for s in args.scales:
-                print(f"Scale: {s} --> Val F1-Score: {val_results[s]['f1']:.4f} | Val Bacc: {val_results[s]['bacc']:.4f} | Val ROC-AUC: {val_results[s]['auc_roc']:.4f}")            
-            
-            print(f"Aggregated Results --> Val F1-Score: {val_results['aggregated']['f1']:.4f} | Val Bacc: {val_results['aggregated']['bacc']:.4f} | Val ROC-AUC: {val_results['aggregated']['auc_roc']:.4f}")
+            evaluated_folds.append(fold)
+            print_split_results('Test' if use_test_as_validation else 'Val', val_results)
+            append_results(all_val_results, val_results)
 
-            # ****** Store val metrics ******
-            for s in args.scales:
-                all_val_results[s]['f1'].append(val_results[s]['f1'])
-                all_val_results[s]['bacc'].append(val_results[s]['bacc'])
-                all_val_results[s]['auc_roc'].append(val_results[s]['auc_roc'])
-            
-            all_val_results['aggregated']['f1'].append(val_results['aggregated']['f1'])
-            all_val_results['aggregated']['bacc'].append(val_results['aggregated']['bacc'])
-            all_val_results['aggregated']['auc_roc'].append(val_results['aggregated']['auc_roc'])
+            primary_val_stats = get_primary_stats(val_results, args)
+            fold_summaries.append({
+                'fold': fold,
+                'auc_roc': primary_val_stats['auc_roc'],
+                'f1': primary_val_stats['f1'],
+                'bacc': primary_val_stats['bacc'],
+                'loss': val_results['loss'],
+                'eval_source': 'test_cohorts' if use_test_as_validation else 'cross_val',
+            })
 
-            # Load best checkpoint model
+            if not use_test_as_validation:
+                val_assignment_df = val_df.copy().reset_index(drop=True)
+                val_assignment_df['fold'] = fold
+                val_assignment_df['split'] = 'val'
+                fold_assignments.extend(val_assignment_df.to_dict('records'))
+
             checkpoint = torch.load(best_checkpoint_path, map_location='cpu', weights_only=False)
-            fold_path = checkpoint['dir_path']  
 
             fold_model = build_model(args)
             fold_model.load_state_dict(checkpoint['model'])
             fold_model.to(device)
             fold_model.eval()
 
+            split_specs = (
+                [('train', train_df), ('test', test_df)]
+                if use_test_as_validation
+                else [('train', train_df), ('val', val_df), ('test', test_df)]
+            )
             save_full_split_predictions(
                 fold_model,
-                [('train', train_df), ('val', val_df), ('test', test_df)],
+                split_specs,
                 path_results_fold,
-                f'{args.dataset}_all_predictions_fold_{fold}',
+                f'{args.dataset}_mil_predictions_fold_{fold}',
                 args,
                 device,
             )
 
             if test_loader is not None:
-                # Evaluate on test set
                 test_targs, test_preds, test_probs, test_results, _ = valid_fn(
-                    test_loader, fold_model, criterion=torch.nn.BCEWithLogitsLoss(reduction='mean'), args=args, device=device, split='test')
+                    test_loader,
+                    fold_model,
+                    criterion=torch.nn.BCEWithLogitsLoss(reduction='mean'),
+                    args=args,
+                    device=device,
+                    split='test',
+                )
 
-                # Log test results
-                print(f"\nTest Loss: {test_results['loss']:.4f}")        
-                
-               
-                for s in args.scales:
-                    print(f"Scale: {s} --> Test F1-Score: {test_results[s]['f1']:.4f} | Test Bacc: {test_results[s]['bacc']:.4f} | Test ROC-AUC: {test_results[s]['auc_roc']:.4f}")            
-                
-             
-                print(f"Aggregated Results --> Test F1-Score: {test_results['aggregated']['f1']:.4f} | Test Bacc: {test_results['aggregated']['bacc']:.4f} | Test ROC-AUC: {test_results['aggregated']['auc_roc']:.4f}")
+                print_split_results('Test', test_results)
+                append_results(all_test_results, test_results)
 
-                # Store test metrics
-                for s in args.scales:
-                    all_test_results[s]['f1'].append(test_results[s]['f1'])
-                    all_test_results[s]['bacc'].append(test_results[s]['bacc'])
-                    all_test_results[s]['auc_roc'].append(test_results[s]['auc_roc'])
-
-                all_test_results['aggregated']['f1'].append(test_results['aggregated']['f1'])
-                all_test_results['aggregated']['bacc'].append(test_results['aggregated']['bacc'])
-                all_test_results['aggregated']['auc_roc'].append(test_results['aggregated']['auc_roc'])
-
-                # Save confusion matrix and ROC curves
-                plot_confusion_matrix(test_results['aggregated']['cf_matrix'], label_dict, '', path_results_fold)
+                primary_test_stats = get_primary_stats(test_results, args)
+                cf_matrix = primary_test_stats.get('cf_matrix')
+                if cf_matrix is not None:
+                    plot_confusion_matrix(cf_matrix, label_dict, '', path_results_fold)
                 ROC_curves(test_targs, test_probs, '', path_results_fold)
-            
             else:
                 print("No test data found. Skipping test evaluation.")
-               
-            
-          
+
             del fold_model
             clear_memory()
-            
-        # Create a dictionary to hold all final results
-        val_results_data = {'folds': np.arange(args.n_folds)}
-        
-  
-        has_test_results = len(all_test_results['aggregated']['bacc']) > 0
 
+        val_results_data = {'folds': evaluated_folds}
+        has_test_results = (
+            len(all_test_results['aggregated']['bacc']) > 0
+            if args.multi_scale_model is not None
+            else len(all_test_results['bacc']) > 0
+        )
         if has_test_results:
-            test_results_data = {'folds': np.arange(args.n_folds)}
-        
-        # Append metrics for all scales
-        for s in args.scales:
-            val_results_data[f'bacc_{s}'] = all_val_results[s]['bacc']
-            val_results_data[f'f1_{s}'] = all_val_results[s]['f1']
-            val_results_data[f'auc_roc_{s}'] = all_val_results[s]['auc_roc']
+            test_results_data = {'folds': evaluated_folds}
+
+        if args.multi_scale_model is not None:
+            if track_side_results:
+                for scale in args.scales:
+                    val_results_data[f'bacc_{scale}'] = all_val_results[scale]['bacc']
+                    val_results_data[f'f1_{scale}'] = all_val_results[scale]['f1']
+                    val_results_data[f'auc_roc_{scale}'] = all_val_results[scale]['auc_roc']
+
+                    if has_test_results:
+                        test_results_data[f'bacc_{scale}'] = all_test_results[scale]['bacc']
+                        test_results_data[f'f1_{scale}'] = all_test_results[scale]['f1']
+                        test_results_data[f'auc_roc_{scale}'] = all_test_results[scale]['auc_roc']
+
+            val_results_data['bacc_aggregated'] = all_val_results['aggregated']['bacc']
+            val_results_data['f1_aggregated'] = all_val_results['aggregated']['f1']
+            val_results_data['auc_roc_aggregated'] = all_val_results['aggregated']['auc_roc']
 
             if has_test_results:
-                test_results_data[f'bacc_{s}'] = all_test_results[s]['bacc']
-                test_results_data[f'f1_{s}'] = all_test_results[s]['f1']
-                test_results_data[f'auc_roc_{s}'] = all_test_results[s]['auc_roc']
-        
-        # Append metrics for aggregated results
-        val_results_data['bacc_aggregated'] = all_val_results['aggregated']['bacc']
-        val_results_data['f1_aggregated'] = all_val_results['aggregated']['f1']
-        val_results_data['auc_roc_aggregated'] = all_val_results['aggregated']['auc_roc']
+                test_results_data['bacc_aggregated'] = all_test_results['aggregated']['bacc']
+                test_results_data['f1_aggregated'] = all_test_results['aggregated']['f1']
+                test_results_data['auc_roc_aggregated'] = all_test_results['aggregated']['auc_roc']
+        else:
+            val_results_data['bacc'] = all_val_results['bacc']
+            val_results_data['f1'] = all_val_results['f1']
+            val_results_data['auc'] = all_val_results['auc_roc']
 
-        if has_test_results:
-            test_results_data['bacc_aggregated'] = all_test_results['aggregated']['bacc']
-            test_results_data['f1_aggregated'] = all_test_results['aggregated']['f1']
-            test_results_data['auc_roc_aggregated'] = all_test_results['aggregated']['auc_roc']
-        
-        # Create the final DataFrame
+            if has_test_results:
+                test_results_data['bacc'] = all_test_results['bacc']
+                test_results_data['f1'] = all_test_results['f1']
+                test_results_data['auc'] = all_test_results['auc_roc']
+
         val_results_data = pd.DataFrame(val_results_data)
         if has_test_results:
             test_results_data = pd.DataFrame(test_results_data)
 
-        # Compute mean and std if multiple folds
-        if args.n_folds > 1: 
-            
-            # Calculate mean and std for specific columns
+        if len(evaluated_folds) > 1:
             val_mean_std = val_results_data.drop('folds', axis=1).agg(['mean', 'std']).reset_index(drop=True)
             val_mean_std['folds'] = ['mean', 'std']
             val_results_data = pd.concat([val_results_data, val_mean_std]).reset_index(drop=True)
@@ -543,15 +642,31 @@ def do_experiments(args, device):
                 test_mean_std['folds'] = ['mean', 'std']
                 test_results_data = pd.concat([test_results_data, test_mean_std]).reset_index(drop=True)
 
-        # Save results to CSV
         if has_test_results:
-            metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
+            if use_test_as_validation:
+                metrics_data = pd.concat([test_results_data], keys=['test'], names=['split', 'index'])
+            else:
+                metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
         else:
-            
             metrics_data = pd.concat([val_results_data], keys=['validation'], names=['split', 'index'])
-            
-        metrics_data = metrics_data.reset_index(level='split') # Reset index to turn the keys into columns
+
+        metrics_data = metrics_data.reset_index(level='split')
         metrics_data.to_csv(args.output_path / 'results_summary.csv', index=False)
+
+        summary_df = pd.DataFrame(fold_summaries)
+        if len(summary_df) > 1:
+            metric_cols = [col for col in summary_df.columns if col not in ['fold', 'eval_source']]
+            mean_std = summary_df[metric_cols].agg(['mean', 'std']).reset_index(drop=True)
+            mean_std['fold'] = ['mean', 'std']
+            mean_std['eval_source'] = 'summary'
+            summary_df = pd.concat([summary_df, mean_std], ignore_index=True)
+        summary_df.to_csv(args.output_path / 'mil_results_summary.csv', index=False)
+
+        if fold_assignments and not use_test_as_validation:
+            fold_df = pd.DataFrame(fold_assignments)
+            fold_df.to_csv(args.output_path / f'{args.dataset}_mil_val_fold_assignments.csv', index=False)
+
+
 def k_experiment(train_df, val_df, output_path, args, device, valid_split_name='val'): 
     """
     Executes a single train/validation experiment.
@@ -619,8 +734,14 @@ def k_experiment(train_df, val_df, output_path, args, device, valid_split_name='
 
 def train_loop(train_loader, valid_loader, model, training_stage_manager, train_criterion, eval_criterion, optimizer, scheduler, scaler, output_path, args, device, valid_split_name='val'):
 
-    best_aucroc = 0.
-    best_epoch = 0 
+    best_aucroc = -float('inf')
+    best_val_loss = float('inf')
+    best_epoch = 0
+    best_val_stats = None
+    best_checkpoint_path = output_path / 'best_model.pth'
+    epochs_without_improvement = 0
+    early_stop_patience = max(0, int(getattr(args, 'early_stop_patience', 0)))
+    early_stop_min_delta = max(0.0, float(getattr(args, 'early_stop_min_delta', 0.0)))
 
     # Dictionaries to keep track of training and validation metrics per epoch
     train_results = {'loss': [], 'f1': [], 'bacc': [], 'auc_roc':[], 'lr':[]}
@@ -639,11 +760,18 @@ def train_loop(train_loader, valid_loader, model, training_stage_manager, train_
         train_stats = train_fn(train_loader, model, train_criterion, optimizer, epoch, args, scheduler, scaler, device)
 
         # validation after the epoch
-        val_stats = valid_fn(valid_loader, model, eval_criterion, args, device, split=valid_split_name, epoch=epoch)
+        val_output = valid_fn(valid_loader, model, eval_criterion, args, device, split=valid_split_name, epoch=epoch)
+        if isinstance(val_output, tuple):
+            _, _, _, val_stats, _ = val_output
+        else:
+            val_stats = val_output
     
         elapsed = time.time() - start_time
 
         valid_display_name = 'Test' if valid_split_name == 'test' else 'Val'
+
+        primary_train_stats = get_primary_stats(train_stats, args)
+        primary_val_stats = get_primary_stats(val_stats, args)
 
         # If using multi-scale model, report scale-specific and aggregated results
         if args.multi_scale_model is not None: 
@@ -653,7 +781,7 @@ def train_loop(train_loader, valid_loader, model, training_stage_manager, train_
                 for s in args.scales:
                     print(f"Scale: {s} --> Train F1-Score: {train_stats[s]['f1']:.4f} | Train Bacc: {train_stats[s]['bacc']:.4f} | Train ROC-AUC: {train_stats[s]['auc_roc']:.4f}")
                 
-            print(f"Aggregated Results --> Train F1-Score: {train_stats['aggregated']['f1']:.4f} | Train Bacc: {train_stats['aggregated']['bacc']:.4f} | Train ROC-AUC: {train_stats['aggregated']['auc_roc']:.4f}")
+            print(f"Aggregated Results --> Train F1-Score: {primary_train_stats['f1']:.4f} | Train Bacc: {primary_train_stats['bacc']:.4f} | Train ROC-AUC: {primary_train_stats['auc_roc']:.4f}")
         
             print(f"\n{valid_display_name} Loss: {val_stats['loss']:.4f}") 
 
@@ -661,92 +789,83 @@ def train_loop(train_loader, valid_loader, model, training_stage_manager, train_
                 for s in args.scales:
                     print(f"Scale: {s} --> {valid_display_name} F1-Score: {val_stats[s]['f1']:.4f} | {valid_display_name} Bacc: {val_stats[s]['bacc']:.4f} | {valid_display_name} ROC-AUC: {val_stats[s]['auc_roc']:.4f}")            
             
-            print(f"Aggregated Results --> {valid_display_name} F1-Score: {val_stats['aggregated']['f1']:.4f} | {valid_display_name} Bacc: {val_stats['aggregated']['bacc']:.4f} | {valid_display_name} ROC-AUC: {val_stats['aggregated']['auc_roc']:.4f}")
-        
-            # Update results dictionary
-            train_results['loss'].append(train_stats['loss'])
-            train_results['f1'].append(train_stats['aggregated']['f1'])
-            train_results['bacc'].append(train_stats['aggregated']['bacc'])
-            train_results['auc_roc'].append(train_stats['aggregated']['auc_roc'])
-            train_results['lr'].append(train_stats['lr'])
-                
-            val_results['loss'].append(val_stats['loss'])
-            val_results['f1'].append(val_stats['aggregated']['f1'])
-            val_results['bacc'].append(val_stats['aggregated']['bacc'])
-            val_results['auc_roc'].append(val_stats['aggregated']['auc_roc'])
-
-            # Save checkpoint if best validation ROC-AUC so far
-            if best_aucroc < val_stats['aggregated']['auc_roc']:
-                best_aucroc = val_stats['aggregated']['auc_roc']
-                best_val_stats = val_stats 
-    
-                best_epoch = epoch + 1
-                              
-                model_name = 'best_model.pth'
-                best_checkpoint_path = output_path / model_name
-                
-                print(f'\nEpoch {epoch + 1} - Save aucroc: {best_aucroc:.4f} Model')
-                    
-                torch.save(
-                    { 
-                        'model': model.state_dict(),
-                        #'predictions': val_predictions,
-                        'epoch': epoch,
-                        'auroc': val_stats['aggregated']['auc_roc'],
-                        'f1': val_stats['aggregated']['f1'], 
-                        'bacc': val_stats['aggregated']['bacc'],
-                        'dir_path': output_path
-                    }, best_checkpoint_path
-                )
+            print(f"Aggregated Results --> {valid_display_name} F1-Score: {primary_val_stats['f1']:.4f} | {valid_display_name} Bacc: {primary_val_stats['bacc']:.4f} | {valid_display_name} ROC-AUC: {primary_val_stats['auc_roc']:.4f}")
 
         else: 
-            # Single scale mil models 
-
-            print(f"\nTrain Loss: {train_stats['loss']:.4f} | Train F1-Score: {train_stats['f1']:.4f} | Train Bacc: {train_stats['bacc']:.4f} | Train ROC-AUC: {train_stats['auc_roc']:.4f}")
+            # Single scale MIL models
+            print(f"\nTrain Loss: {train_stats['loss']:.4f} | Train F1-Score: {primary_train_stats['f1']:.4f} | Train Bacc: {primary_train_stats['bacc']:.4f} | Train ROC-AUC: {primary_train_stats['auc_roc']:.4f}")
             
-            print(f"\n{valid_display_name} Loss: {val_stats['loss']:.4f} | {valid_display_name} F1-Score: {val_stats['f1']:.4f} | {valid_display_name} Bacc: {val_stats['bacc']:.4f} | {valid_display_name} ROC-AUC: {val_stats['auc_roc']:.4f}\n")
-        
-            # Update results dictionary
-            train_results['loss'].append(train_stats['loss'])
-            train_results['f1'].append(train_stats['f1'])
-            train_results['bacc'].append(train_stats['bacc'])
-            train_results['auc_roc'].append(train_stats['auc_roc'])
-            train_results['lr'].append(train_stats['lr'])
-                
-            val_results['loss'].append(val_stats['loss'])
-            val_results['f1'].append(val_stats['f1'])
-            val_results['bacc'].append(val_stats['bacc'])
-            val_results['auc_roc'].append(val_stats['auc_roc'])
+            print(f"\n{valid_display_name} Loss: {val_stats['loss']:.4f} | {valid_display_name} F1-Score: {primary_val_stats['f1']:.4f} | {valid_display_name} Bacc: {primary_val_stats['bacc']:.4f} | {valid_display_name} ROC-AUC: {primary_val_stats['auc_roc']:.4f}\n")
 
-            # Save checkpoint if best validation ROC-AUC so far
-            if best_aucroc < val_stats['auc_roc']:
-                best_aucroc = val_stats['auc_roc']
-                best_val_stats = val_stats 
-    
-                best_epoch = epoch + 1
-                              
-                model_name = 'best_model.pth'
-                best_checkpoint_path = output_path / model_name
+        train_results['loss'].append(train_stats['loss'])
+        train_results['f1'].append(primary_train_stats['f1'])
+        train_results['bacc'].append(primary_train_stats['bacc'])
+        train_results['auc_roc'].append(primary_train_stats['auc_roc'])
+        train_results['lr'].append(train_stats['lr'])
+            
+        val_results['loss'].append(val_stats['loss'])
+        val_results['f1'].append(primary_val_stats['f1'])
+        val_results['bacc'].append(primary_val_stats['bacc'])
+        val_results['auc_roc'].append(primary_val_stats['auc_roc'])
+        save_mil_loss_curve(train_results, val_results, output_path)
+
+        val_auc = primary_val_stats['auc_roc']
+        val_auc_is_valid = np.isfinite(val_auc)
+        should_save = (
+            (val_auc_is_valid and val_auc > best_aucroc + early_stop_min_delta)
+            or (not val_auc_is_valid and val_stats['loss'] < best_val_loss - early_stop_min_delta)
+            or best_val_stats is None
+        )
+
+        if should_save:
+            epochs_without_improvement = 0
+            if val_auc_is_valid:
+                best_aucroc = val_auc
+            best_val_loss = val_stats['loss']
+            best_val_stats = val_stats 
+            best_epoch = epoch + 1
+
+            if val_auc_is_valid:
+                print(f'\nEpoch {epoch + 1} - Save aucroc: {best_aucroc:.4f} Model')
+            else:
+                print(f"\nEpoch {epoch + 1} - {valid_display_name} AUC is undefined; save best validation loss: {best_val_loss:.4f}")
                 
-                print(f'Epoch {epoch + 1} - Save aucroc: {best_aucroc:.4f} Model')
-                    
-                torch.save(
-                    { 
-                        'model': model.state_dict(),
-                        #'predictions': val_predictions,
-                        'epoch': epoch,
-                        'auroc': val_stats['auc_roc'],
-                        'f1': val_stats['f1'], 
-                        'bacc': val_stats['bacc'],
-                        'dir_path': output_path
-                    }, best_checkpoint_path
+            torch.save(
+                { 
+                    'model': model.state_dict(),
+                    'epoch': epoch,
+                    'auroc': primary_val_stats['auc_roc'],
+                    'f1': primary_val_stats['f1'], 
+                    'bacc': primary_val_stats['bacc'],
+                    'dir_path': output_path
+                }, best_checkpoint_path
+            )
+        else:
+            epochs_without_improvement += 1
+
+        if np.isfinite(best_aucroc):
+            print(f'\nbest AUC-ROC Score at epoch {best_epoch}: {best_aucroc:.4f}')
+        else:
+            print(f'\nbest validation loss at epoch {best_epoch}: {best_val_loss:.4f} (AUC undefined)')
+
+        if early_stop_patience > 0:
+            print(
+                f"Early stopping: {epochs_without_improvement}/"
+                f"{early_stop_patience} epochs without improvement"
+            )
+            if epochs_without_improvement >= early_stop_patience:
+                print(
+                    f"Early stopping triggered at epoch {epoch + 1}. "
+                    f"Best epoch: {best_epoch}."
                 )
-
-        print(f'\nbest AUC-ROC Score at epoch {best_epoch}: {best_aucroc:.4f}')
+                break
 
     # Plot learning rate scheduler curve and training/validation metrics curves
     plot_lrs_scheduler(train_results['lr'], output_path)
-    plot_loss_and_acc_curves(train_results, val_results, 'auc_roc', output_path)
+    try:
+        plot_loss_and_acc_curves(train_results, val_results, 'auc_roc', output_path)
+    except Exception as exc:
+        print(f"[MIL] Warning: failed to save legacy loss curves: {exc}")
 
     # Clear GPU memory cache and garbage collect
     torch.cuda.empty_cache()
