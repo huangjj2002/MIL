@@ -44,6 +44,25 @@ def config():
     parser.add_argument("--n_folds", default=1, type=int)
     parser.add_argument("--start-fold", default=0, type=int)
     parser.add_argument(
+        "--kfold0-val-frac",
+        "--kfold0_val_frac",
+        dest="kfold0_val_frac",
+        default=0.2,
+        type=float,
+        help="Validation fraction split from train cohorts when --n_folds 0.",
+    )
+    parser.add_argument(
+        "--kfold0-val-max-frac",
+        "--kfold0_val_max_frac",
+        dest="kfold0_val_max_frac",
+        default=0.5,
+        type=float,
+        help=(
+            "Maximum validation fraction allowed when --n_folds 0 needs a larger "
+            "validation split to contain both classes."
+        ),
+    )
+    parser.add_argument(
         "--train-cohorts", "--train_cohorts",
         dest="train_cohorts",
         default="1-8",

@@ -20,6 +20,7 @@ from utils.generic_utils import seed_all, AverageMeter, timeSince, print_network
 from utils.training_setup_utils import initialize_training_setup, Training_Stage_Config
 from utils.plot_utils import plot_loss_and_acc_curves, plot_lrs_scheduler, plot_confusion_matrix, ROC_curves
 from utils.data_split_utils import (
+    adaptive_stratified_train_val_split,
     generator_cross_val_folds,
     split_df_by_cohorts,
     stratified_train_val_split,
@@ -222,17 +223,23 @@ def do_experiments(args, device):
     if args.data_frac < 1.0:
         dev_df = dev_df.sample(frac=args.data_frac, random_state=1, ignore_index=True) 
 
-    if args.eval_scheme == 'kfold_cv+test' and args.n_folds == 0:
-        print("[Auto-Config] n_folds=0 detected. Using train cohorts for training and test cohorts for validation.")
+    if args.n_folds == 0:
+        print(
+            "[Auto-Config] n_folds=0 detected. Creating an internal validation "
+            "split from train cohorts; test cohorts remain held out."
+        )
 
     # repeated k runs using fixed data splits 
     if args.eval_scheme == 'kruns_train+val+test': 
-        use_test_as_validation = args.n_folds == 0
-
         # split development set into training and validation sets
-        if use_test_as_validation:
-            train_df = dev_df.reset_index(drop=True)
-            val_df = test_df.reset_index(drop=True)
+        if args.n_folds == 0:
+            train_df, val_df = adaptive_stratified_train_val_split(
+                dev_df,
+                val_frac=args.kfold0_val_frac,
+                max_val_frac=args.kfold0_val_max_frac,
+                args=args,
+                context="MIL n_folds=0 internal train/val split",
+            )
         else:
             train_df, val_df = stratified_train_val_split(dev_df, args.val_split, args=args)
 
@@ -280,7 +287,7 @@ def do_experiments(args, device):
                 output_path=path_results_run,
                 args=args,
                 device=device,
-                valid_split_name='test' if use_test_as_validation else 'val',
+                valid_split_name='val',
             )
 
             # load the best model checkpoint
@@ -296,7 +303,7 @@ def do_experiments(args, device):
 
             save_full_split_predictions(
                 fold_model,
-                [('train', train_df), ('test', test_df)] if use_test_as_validation else [('train', train_df), ('val', val_df), ('test', test_df)],
+                [('train', train_df), ('val', val_df), ('test', test_df)],
                 path_results_run,
                 f'{args.dataset}_all_predictions_run_{args.start_run + idx_run}',
                 args,
@@ -413,19 +420,23 @@ def do_experiments(args, device):
             test_results_data = pd.concat([test_results_data, test_mean_std]).reset_index(drop=True)
 
         # Combine validation and test results
-        if use_test_as_validation:
-            metrics_data = pd.concat([test_results_data], keys=['test'], names=['split', 'index'])
-        else:
-            metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
+        metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
         metrics_data = metrics_data.reset_index(level='split') # Reset index to turn the keys into columns
         metrics_data.to_csv(args.output_path / 'results_summary.csv', index=False)
 
 
     elif args.eval_scheme == 'kfold_cv+test':
 
-        use_test_as_validation = args.n_folds == 0
-        if use_test_as_validation:
-            split_iter = [(0, (dev_df.reset_index(drop=True), test_df.reset_index(drop=True)))]
+        single_internal_val = args.n_folds == 0
+        if single_internal_val:
+            train_df, val_df = adaptive_stratified_train_val_split(
+                dev_df,
+                val_frac=args.kfold0_val_frac,
+                max_val_frac=args.kfold0_val_max_frac,
+                args=args,
+                context="MIL n_folds=0 internal train/val split",
+            )
+            split_iter = [(0, (train_df, val_df))]
             total_folds = 1
         else:
             split_iter = enumerate(
@@ -512,7 +523,7 @@ def do_experiments(args, device):
             path_results_fold = args.output_path / f'fold_{fold}'
             Path(path_results_fold).mkdir(parents=True, exist_ok=True)
 
-            valid_split_name = 'test' if use_test_as_validation else 'val'
+            valid_split_name = 'val'
             print(f"Train: {len(train_df)}, {valid_split_name.capitalize()}: {len(val_df)}")
 
             val_results, best_checkpoint_path = k_experiment(
@@ -525,7 +536,7 @@ def do_experiments(args, device):
             )
 
             evaluated_folds.append(fold)
-            print_split_results('Test' if use_test_as_validation else 'Val', val_results)
+            print_split_results('Val', val_results)
             append_results(all_val_results, val_results)
 
             primary_val_stats = get_primary_stats(val_results, args)
@@ -535,14 +546,13 @@ def do_experiments(args, device):
                 'f1': primary_val_stats['f1'],
                 'bacc': primary_val_stats['bacc'],
                 'loss': val_results['loss'],
-                'eval_source': 'test_cohorts' if use_test_as_validation else 'cross_val',
+                'eval_source': 'internal_val' if single_internal_val else 'cross_val',
             })
 
-            if not use_test_as_validation:
-                val_assignment_df = val_df.copy().reset_index(drop=True)
-                val_assignment_df['fold'] = fold
-                val_assignment_df['split'] = 'val'
-                fold_assignments.extend(val_assignment_df.to_dict('records'))
+            val_assignment_df = val_df.copy().reset_index(drop=True)
+            val_assignment_df['fold'] = fold
+            val_assignment_df['split'] = 'val'
+            fold_assignments.extend(val_assignment_df.to_dict('records'))
 
             checkpoint = torch.load(best_checkpoint_path, map_location='cpu', weights_only=False)
 
@@ -551,11 +561,7 @@ def do_experiments(args, device):
             fold_model.to(device)
             fold_model.eval()
 
-            split_specs = (
-                [('train', train_df), ('test', test_df)]
-                if use_test_as_validation
-                else [('train', train_df), ('val', val_df), ('test', test_df)]
-            )
+            split_specs = [('train', train_df), ('val', val_df), ('test', test_df)]
             save_full_split_predictions(
                 fold_model,
                 split_specs,
@@ -643,10 +649,7 @@ def do_experiments(args, device):
                 test_results_data = pd.concat([test_results_data, test_mean_std]).reset_index(drop=True)
 
         if has_test_results:
-            if use_test_as_validation:
-                metrics_data = pd.concat([test_results_data], keys=['test'], names=['split', 'index'])
-            else:
-                metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
+            metrics_data = pd.concat([val_results_data, test_results_data], keys=['validation', 'test'], names=['split', 'index'])
         else:
             metrics_data = pd.concat([val_results_data], keys=['validation'], names=['split', 'index'])
 
@@ -662,7 +665,7 @@ def do_experiments(args, device):
             summary_df = pd.concat([summary_df, mean_std], ignore_index=True)
         summary_df.to_csv(args.output_path / 'mil_results_summary.csv', index=False)
 
-        if fold_assignments and not use_test_as_validation:
+        if fold_assignments:
             fold_df = pd.DataFrame(fold_assignments)
             fold_df.to_csv(args.output_path / f'{args.dataset}_mil_val_fold_assignments.csv', index=False)
 

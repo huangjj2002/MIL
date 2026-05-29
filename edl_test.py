@@ -35,7 +35,11 @@ from MIL.edl_models import EDLHead, MIL_EDL_Wrapper
 from MIL.edl_losses import EDLCombinedLoss
 from utils.metrics import auroc, evaluate_metrics
 from utils.generic_utils import seed_all, clear_memory
-from utils.data_split_utils import generator_cross_val_folds, split_df_by_cohorts
+from utils.data_split_utils import (
+    adaptive_stratified_train_val_split,
+    generator_cross_val_folds,
+    split_df_by_cohorts,
+)
 from sklearn.metrics import confusion_matrix
 
 
@@ -117,6 +121,25 @@ def config():
     parser.add_argument("--num-workers", default=4, type=int)
     parser.add_argument("--seed", default=10, type=int)
     parser.add_argument("--n_folds", default=5, type=int)
+    parser.add_argument(
+        "--kfold0-val-frac",
+        "--kfold0_val_frac",
+        dest="kfold0_val_frac",
+        default=0.2,
+        type=float,
+        help="Validation fraction split from train cohorts when --n_folds 0.",
+    )
+    parser.add_argument(
+        "--kfold0-val-max-frac",
+        "--kfold0_val_max_frac",
+        dest="kfold0_val_max_frac",
+        default=0.5,
+        type=float,
+        help=(
+            "Maximum validation fraction allowed when --n_folds 0 needs a larger "
+            "validation split to contain both classes."
+        ),
+    )
     parser.add_argument(
         "--train-cohorts", "--train_cohorts",
         dest="train_cohorts",
@@ -300,17 +323,27 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
     if args.data_frac < 1.0:
         dev_df = dev_df.sample(frac=args.data_frac, random_state=1, ignore_index=True)
     
-    use_test_as_validation = args.n_folds == 0
+    single_internal_val = args.n_folds == 0
+    total_folds = 1 if single_internal_val else args.n_folds
 
     # Prefer the fold assignment produced by training. If absent, recreate the
-    # same generator path after resetting the seed.
+    # same split path after resetting the seed.
     assignment_path = checkpoint_dir / f'{args.dataset}_edl_val_fold_assignments.csv'
     fold_val_dfs = {}
-    if not use_test_as_validation:
-        if assignment_path.exists():
-            assignment_df = pd.read_csv(assignment_path)
-            for fold in range(args.n_folds):
-                fold_val_dfs[fold] = assignment_df[assignment_df['fold'] == fold].reset_index(drop=True)
+    if assignment_path.exists():
+        assignment_df = pd.read_csv(assignment_path)
+        for fold in range(total_folds):
+            fold_val_dfs[fold] = assignment_df[assignment_df['fold'] == fold].reset_index(drop=True)
+    else:
+        if single_internal_val:
+            _, val_df_fold = adaptive_stratified_train_val_split(
+                dev_df,
+                val_frac=args.kfold0_val_frac,
+                max_val_frac=args.kfold0_val_max_frac,
+                args=args,
+                context="EDL test n_folds=0 internal train/val split",
+            )
+            fold_val_dfs[0] = val_df_fold.reset_index(drop=True)
         else:
             for fold_idx, (_, val_df_fold) in enumerate(
                 generator_cross_val_folds(dev_df, args.n_folds, args.label, random_state=args.seed)
@@ -326,7 +359,6 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
     dev_results_df = None
     test_ensemble = None
     
-    total_folds = 1 if use_test_as_validation else args.n_folds
     for fold in range(total_folds):
         print(f"\n--- Fold {fold} ---")
         
@@ -338,7 +370,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
         model = build_edl_model(args, ckpt_path)
         model.to(device)
         
-        val_df = test_df.reset_index(drop=True) if use_test_as_validation else fold_val_dfs.get(fold, pd.DataFrame()).reset_index(drop=True)
+        val_df = fold_val_dfs.get(fold, pd.DataFrame()).reset_index(drop=True)
         if len(val_df) == 0:
             print(f"Warning: no validation rows found for fold {fold}, skipping")
             continue
@@ -351,7 +383,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
         val_result_df = pd.DataFrame({
             'patient_id': val_results['patient_id'],
             'image_id': val_results['image_id'],
-            'split': 'test' if use_test_as_validation else 'val',
+            'split': 'val',
             label_col: val_results['label'],
             'prediction_score': val_results['score'],
             'predicted_class': val_results['pred'],
@@ -376,8 +408,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
         try:
             fold_auc = auroc(targs, probs)
             fold_f1, fold_bacc = evaluate_metrics(targs, preds)
-            metric_name = 'Test' if use_test_as_validation else 'Val'
-            print(f"  Fold {fold} {metric_name} - AUC: {fold_auc:.4f}, F1: {fold_f1:.4f}, BAcc: {fold_bacc:.4f}")
+            print(f"  Fold {fold} Val - AUC: {fold_auc:.4f}, F1: {fold_f1:.4f}, BAcc: {fold_bacc:.4f}")
         except Exception as e:
             print(f"  Fold {fold} metrics error: {e}")
         
@@ -386,24 +417,16 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
     
     if all_dev_results:
         dev_results_df = pd.concat(all_dev_results, ignore_index=True)
-        if use_test_as_validation:
-            dev_results_df.to_csv(output_dir / f'{args.dataset}_edl_test_all_folds.csv', index=False)
-            test_ensemble = dev_results_df.copy()
-            test_ensemble['fold'] = 'ensemble'
-            test_ensemble.to_csv(output_dir / f'{args.dataset}_edl_test_ensemble.csv', index=False)
-            print(f"\nTest predictions saved: {len(test_ensemble)} samples")
-            dev_results_df = None
-        else:
-            dev_results_df.to_csv(output_dir / f'{args.dataset}_edl_dev_predictions.csv', index=False)
-            print(f"\nDev predictions saved: {len(dev_results_df)} samples")
+        dev_results_df.to_csv(output_dir / f'{args.dataset}_edl_dev_predictions.csv', index=False)
+        print(f"\nDev predictions saved: {len(dev_results_df)} samples")
     
     # ========== Predict on test data ==========
-    if len(test_df) > 0 and not use_test_as_validation:
+    if len(test_df) > 0:
         print("\n===== Predicting on test data =====")
         
         test_all_fold_results = []
         
-        for fold in range(args.n_folds):
+        for fold in range(total_folds):
             print(f"\n--- Test with Fold {fold} model ---")
             
             ckpt_path = checkpoint_dir / f'fold_{fold}' / 'best_model.pth'

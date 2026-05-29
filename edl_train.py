@@ -41,7 +41,11 @@ from MIL.edl_models import EDLHead, MIL_EDL_Wrapper
 from MIL.edl_losses import EDLCombinedLoss, edl_crossentropy_loss, kl_divergence_dirichlet
 from utils.metrics import auroc, evaluate_metrics
 from utils.generic_utils import seed_all, AverageMeter, clear_memory
-from utils.data_split_utils import generator_cross_val_folds, split_df_by_cohorts
+from utils.data_split_utils import (
+    adaptive_stratified_train_val_split,
+    generator_cross_val_folds,
+    split_df_by_cohorts,
+)
 
 
 def config():
@@ -74,6 +78,25 @@ def config():
     parser.add_argument("--num-classes", default=1, type=int)
     parser.add_argument("--n_folds", default=5, type=int)
     parser.add_argument("--start-fold", default=0, type=int)
+    parser.add_argument(
+        "--kfold0-val-frac",
+        "--kfold0_val_frac",
+        dest="kfold0_val_frac",
+        default=0.2,
+        type=float,
+        help="Validation fraction split from train cohorts when --n_folds 0.",
+    )
+    parser.add_argument(
+        "--kfold0-val-max-frac",
+        "--kfold0_val_max_frac",
+        dest="kfold0_val_max_frac",
+        default=0.5,
+        type=float,
+        help=(
+            "Maximum validation fraction allowed when --n_folds 0 needs a larger "
+            "validation split to contain both classes."
+        ),
+    )
     parser.add_argument(
         "--train-cohorts", "--train_cohorts",
         dest="train_cohorts",
@@ -616,6 +639,12 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         # fold still produces a usable checkpoint.
         val_auc = val_stats['auc_roc']
         val_auc_is_valid = np.isfinite(val_auc)
+        annealing_coeff = (
+            criterion.get_annealing_coeff(epoch)
+            if hasattr(criterion, 'get_annealing_coeff')
+            else 1.0
+        )
+        annealing_complete = annealing_coeff >= 1.0
         should_save = (
             (val_auc_is_valid and val_auc > best_aucroc + early_stop_min_delta)
             or (not val_auc_is_valid and val_stats['loss'] < best_val_loss - early_stop_min_delta)
@@ -644,6 +673,8 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
                 'bacc': val_stats['bacc'],
                 'dir_path': output_path,
             }, best_checkpoint_path)
+        elif early_stop_patience > 0 and not annealing_complete:
+            epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
         
@@ -653,16 +684,22 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
             print(f'\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f} (AUC undefined)')
 
         if early_stop_patience > 0:
-            print(
-                f"Early stopping: {epochs_without_improvement}/"
-                f"{early_stop_patience} epochs without improvement"
-            )
-            if epochs_without_improvement >= early_stop_patience:
+            if not annealing_complete:
                 print(
-                    f"Early stopping triggered at epoch {epoch + 1}. "
-                    f"Best epoch: {best_epoch}."
+                    "Early stopping paused until EDL annealing completes "
+                    f"(annealing={annealing_coeff:.3f})."
                 )
-                break
+            else:
+                print(
+                    f"Early stopping: {epochs_without_improvement}/"
+                    f"{early_stop_patience} epochs without improvement"
+                )
+                if epochs_without_improvement >= early_stop_patience:
+                    print(
+                        f"Early stopping triggered at epoch {epoch + 1}. "
+                        f"Best epoch: {best_epoch}."
+                    )
+                    break
     
     torch.cuda.empty_cache()
     gc.collect()
@@ -707,9 +744,20 @@ def do_edl_training(args, device):
     with open(args.output_path / "args.yaml", 'w') as f:
         yaml.safe_dump(args_dict, f, default_flow_style=False)
     
-    use_test_as_validation = args.n_folds == 0
-    if use_test_as_validation:
-        split_iter = [(dev_df.reset_index(drop=True), test_df.reset_index(drop=True))]
+    single_internal_val = args.n_folds == 0
+    if single_internal_val:
+        print(
+            "[Auto-Config] n_folds=0 detected. Creating an internal validation "
+            "split from train cohorts; test cohorts remain held out."
+        )
+        train_df, val_df = adaptive_stratified_train_val_split(
+            dev_df,
+            val_frac=args.kfold0_val_frac,
+            max_val_frac=args.kfold0_val_max_frac,
+            args=args,
+            context="EDL n_folds=0 internal train/val split",
+        )
+        split_iter = [(train_df, val_df)]
         total_folds = 1
     else:
         split_iter = generator_cross_val_folds(
@@ -740,7 +788,7 @@ def do_edl_training(args, device):
         path_results_fold = args.output_path / f'fold_{fold}'
         Path(path_results_fold).mkdir(parents=True, exist_ok=True)
         
-        valid_split_name = 'test' if use_test_as_validation else 'val'
+        valid_split_name = 'val'
         print(f"Train: {len(train_df)}, {valid_split_name.capitalize()}: {len(val_df)}")
 
         train_loader = MIL_dataloader(train_df, 'train', args)
@@ -810,7 +858,7 @@ def do_edl_training(args, device):
             'f1': val_stats['f1'],
             'bacc': val_stats['bacc'],
             'loss': val_stats['loss'],
-            'eval_source': 'test_cohorts' if use_test_as_validation else 'cross_val',
+            'eval_source': 'internal_val' if single_internal_val else 'cross_val',
         }
         all_val_results.append(fold_summary)
         
@@ -822,7 +870,7 @@ def do_edl_training(args, device):
         
         # Generate predictions for all data (train + val + test)
         all_split_dfs = []
-        split_specs = [('train', train_df), ('test', test_df)] if use_test_as_validation else [('train', train_df), ('val', val_df), ('test', test_df)]
+        split_specs = [('train', train_df), ('val', val_df), ('test', test_df)]
         for split_name, split_df in split_specs:
             if split_df is None or len(split_df) == 0:
                 continue
@@ -886,7 +934,7 @@ def do_edl_training(args, device):
     print(summary_df.to_string())
     
     # Save fold assignments
-    if fold_assignments and not use_test_as_validation:
+    if fold_assignments:
         fold_df = pd.DataFrame(fold_assignments)
         fold_df.to_csv(args.output_path / f'{args.dataset}_edl_val_fold_assignments.csv', index=False)
         print(f"Fold assignments saved ({len(fold_df)} validation samples)")
