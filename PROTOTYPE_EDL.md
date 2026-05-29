@@ -108,6 +108,33 @@ proto_c1_top1_similarity
 
 如果某一类样本少于 `K`，实现会重复已有中心补齐并打印 warning。这样可以避免初始化阶段因为少数类样本过少而中断。
 
+KMeans 只是 prototype 的初始化方式，训练时 prototype 仍然是可学习参数。新增的 prototype regularization 会在训练过程中继续约束这些 prototype，二者可以同时使用。
+
+## Prototype 正则
+
+Prototype + EDL 路径默认增加三类 prototype 正则，只作用于 `edl_proto_train.py`，不会影响原 EDL baseline：
+
+```text
+total_loss = EDLCombinedLoss + prototype_regularization
+```
+
+正则项包括：
+
+- 同类吸引：每个样本靠近自己标签对应类别的最近 prototype。
+- 异类排斥：每个样本远离另一类的最近 prototype，使用 margin loss。
+- prototype 多样性：同一类别内部的 prototype 彼此保持距离，避免塌缩成一个点。
+
+相关参数：
+
+```text
+--edl_proto_attract_weight      default 0.1
+--edl_proto_separation_weight   default 0.1
+--edl_proto_diversity_weight    default 0.01
+--edl_proto_margin              default 1.0
+```
+
+如果想先观察纯 Prototype + EDL head 的效果，可以把三个 weight 都设为 `0`。如果 prototype 解释性弱或出现塌缩，可以优先提高 `--edl_proto_diversity_weight` 或 `--edl_proto_separation_weight`。
+
 ## 当前项目用法
 
 训练 Prototype + EDL：
@@ -124,7 +151,11 @@ python edl_proto_train.py \
   --n_folds 5 \
   --epochs 20 \
   --edl_proto_k 4 \
-  --edl_proto_topk 3
+  --edl_proto_topk 3 \
+  --edl_proto_attract_weight 0.1 \
+  --edl_proto_separation_weight 0.1 \
+  --edl_proto_diversity_weight 0.01 \
+  --edl_proto_margin 1.0
 ```
 
 单独测试已有 Prototype + EDL checkpoint：

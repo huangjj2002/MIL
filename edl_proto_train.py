@@ -6,8 +6,10 @@ existing EDL scripts are intentionally left unchanged.
 """
 
 import argparse
+import gc
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,7 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
 
@@ -29,17 +32,18 @@ from edl_train import (
     _get_checkpoint_state_dict,
     _print_load_summary,
     config as base_edl_config,
-    edl_train_loop,
+    edl_valid_fn,
     freeze_mil_backbone_train_edl_only,
     get_edl_class_weights,
     resolve_mil_checkpoint,
+    save_loss_curve,
 )
 from utils.data_split_utils import (
     adaptive_stratified_train_val_split,
     generator_cross_val_folds,
     split_df_by_cohorts,
 )
-from utils.generic_utils import clear_memory, seed_all
+from utils.generic_utils import AverageMeter, clear_memory, seed_all
 from utils.metrics import auroc, evaluate_metrics
 
 
@@ -54,6 +58,14 @@ def _add_proto_args(parser):
                         help="Normalize embeddings and prototypes before distance computation.")
     parser.add_argument("--edl_proto_init", default="kmeans", choices=["kmeans", "random"],
                         help="Prototype initialization method.")
+    parser.add_argument("--edl_proto_attract_weight", default=0.1, type=float,
+                        help="Weight for pulling samples toward same-class prototypes.")
+    parser.add_argument("--edl_proto_separation_weight", default=0.1, type=float,
+                        help="Weight for pushing samples away from opposite-class prototypes.")
+    parser.add_argument("--edl_proto_diversity_weight", default=0.01, type=float,
+                        help="Weight for keeping same-class prototypes diverse.")
+    parser.add_argument("--edl_proto_margin", default=1.0, type=float,
+                        help="Distance margin used by prototype separation/diversity losses.")
 
 
 def config():
@@ -151,6 +163,343 @@ def _move_inputs_to_device(data, device, non_blocking=True):
     if isinstance(data["x"], list):
         return [tensor.to(device, non_blocking=non_blocking) for tensor in data["x"]]
     return data["x"].to(device, non_blocking=non_blocking)
+
+
+def _zero_like_loss(edl_out):
+    return edl_out["alpha"].sum() * 0.0
+
+
+def _single_output_proto_reg(edl_out, labels, margin):
+    """Sample-prototype attraction and opposite-class separation for one head."""
+    if "prototype_distances" not in edl_out:
+        zero = _zero_like_loss(edl_out)
+        return zero, zero, zero
+
+    distances = edl_out["prototype_distances"]
+    labels = labels.long()
+    batch_idx = torch.arange(labels.size(0), device=labels.device)
+
+    same_distances = distances[batch_idx, labels]
+    attraction = same_distances.min(dim=-1).values.mean()
+
+    if distances.size(1) == 2:
+        opposite_labels = 1 - labels
+        opposite_distances = distances[batch_idx, opposite_labels]
+        nearest_opposite = opposite_distances.min(dim=-1).values
+    else:
+        class_mask = torch.ones(
+            distances.size(0),
+            distances.size(1),
+            dtype=torch.bool,
+            device=distances.device,
+        )
+        class_mask[batch_idx, labels] = False
+        nearest_opposite = distances[class_mask].view(distances.size(0), -1).min(dim=-1).values
+
+    separation = F.relu(float(margin) - nearest_opposite).mean()
+    return attraction, separation, attraction + separation
+
+
+def _prototype_diversity_loss(model, margin):
+    """Penalize same-class prototype collapse for all prototype heads."""
+    heads = model.prototype_heads() if hasattr(model, "prototype_heads") else {}
+    losses = []
+
+    for head in heads.values():
+        prototypes = head.prototypes
+        if head.normalize:
+            prototypes = F.normalize(prototypes, dim=-1)
+
+        for class_idx in range(prototypes.size(0)):
+            class_prototypes = prototypes[class_idx]
+            if class_prototypes.size(0) < 2:
+                continue
+            pairwise_distances = torch.cdist(
+                class_prototypes.unsqueeze(0),
+                class_prototypes.unsqueeze(0),
+                p=2,
+            ).squeeze(0).pow(2)
+            mask = ~torch.eye(
+                class_prototypes.size(0),
+                dtype=torch.bool,
+                device=class_prototypes.device,
+            )
+            losses.append(F.relu(float(margin) - pairwise_distances[mask]).mean())
+
+    if losses:
+        return torch.stack(losses).mean()
+
+    first_param = next(model.parameters())
+    return first_param.sum() * 0.0
+
+
+def prototype_regularization_loss(model, edl_out, labels, args):
+    """Combined prototype regularization for main and side Prototype+EDL heads."""
+    margin = float(getattr(args, "edl_proto_margin", 1.0))
+    attract_weight = float(getattr(args, "edl_proto_attract_weight", 0.0))
+    separation_weight = float(getattr(args, "edl_proto_separation_weight", 0.0))
+    diversity_weight = float(getattr(args, "edl_proto_diversity_weight", 0.0))
+
+    head_outputs = [
+        head_out
+        for head_out in [edl_out] + list(edl_out.get("side_outputs", {}).values())
+        if "prototype_distances" in head_out
+    ]
+    if not head_outputs:
+        zero = _zero_like_loss(edl_out)
+        diversity_loss = _prototype_diversity_loss(model, margin)
+        total = diversity_weight * diversity_loss
+        return total, {
+            "proto_attract": zero.detach(),
+            "proto_separate": zero.detach(),
+            "proto_diverse": diversity_loss.detach(),
+            "proto_reg": total.detach(),
+        }
+
+    attractions = []
+    separations = []
+    for head_out in head_outputs:
+        attraction, separation, _ = _single_output_proto_reg(head_out, labels, margin)
+        attractions.append(attraction)
+        separations.append(separation)
+
+    attraction_loss = torch.stack(attractions).mean()
+    separation_loss = torch.stack(separations).mean()
+    diversity_loss = _prototype_diversity_loss(model, margin)
+
+    total = (
+        attract_weight * attraction_loss
+        + separation_weight * separation_loss
+        + diversity_weight * diversity_loss
+    )
+    return total, {
+        "proto_attract": attraction_loss.detach(),
+        "proto_separate": separation_loss.detach(),
+        "proto_diverse": diversity_loss.detach(),
+        "proto_reg": total.detach(),
+    }
+
+
+def keep_frozen_mil_backbone_in_eval(model, args):
+    """Keep frozen backbone modules deterministic while prototype heads train."""
+    if getattr(args, "train_edl_only", False):
+        model.mil_model.eval()
+
+
+def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device):
+    """Training loop for one epoch with EDL loss plus prototype regularization."""
+    model.train()
+    keep_frozen_mil_backbone_in_eval(model, args)
+    model.is_training = True
+
+    losses = AverageMeter()
+    ce_losses = AverageMeter()
+    kl_losses = AverageMeter()
+    proto_losses = AverageMeter()
+    proto_attract_losses = AverageMeter()
+    proto_separation_losses = AverageMeter()
+    proto_diversity_losses = AverageMeter()
+
+    progress_iter = tqdm(
+        enumerate(train_loader),
+        desc=f"[{epoch + 1:03d}/{args.epochs:03d} EDL_PROTO train]",
+        total=len(train_loader),
+    )
+
+    targs = []
+    probs_list = []
+    preds_list = []
+
+    for _, data in progress_iter:
+        inputs = _move_inputs_to_device(data, device, non_blocking=False)
+        labels = data["y"].long().to(device)
+        batch_size = labels.size(0)
+
+        amp_enabled = bool(args.apex) and device.type == "cuda"
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            edl_out = model(inputs)
+            alpha = edl_out["alpha"]
+            loss, loss_dict = criterion(alpha, labels, epoch=epoch)
+            for side_out in edl_out.get("side_outputs", {}).values():
+                side_loss, _ = criterion(side_out["alpha"], labels, epoch=epoch)
+                loss = loss + side_loss
+
+            proto_reg, proto_dict = prototype_regularization_loss(model, edl_out, labels, args)
+            loss = loss + proto_reg
+
+        losses.update(loss.item(), batch_size)
+        ce_losses.update(loss_dict["ce_loss"], batch_size)
+        kl_losses.update(loss_dict["kl_loss"], batch_size)
+        proto_losses.update(float(proto_dict["proto_reg"].item()), batch_size)
+        proto_attract_losses.update(float(proto_dict["proto_attract"].item()), batch_size)
+        proto_separation_losses.update(float(proto_dict["proto_separate"].item()), batch_size)
+        proto_diversity_losses.update(float(proto_dict["proto_diverse"].item()), batch_size)
+
+        scaler.scale(loss).backward()
+        if args.clip_grad > 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        scheduler.step()
+
+        prob = edl_out["prob"].detach()
+        pred_class = torch.argmax(prob, dim=-1)
+        targs.append(labels.cpu().numpy())
+        probs_list.append(prob[:, 1].cpu().numpy())
+        preds_list.append(pred_class.cpu().numpy())
+
+        cuda_mem = torch.cuda.memory_usage(device) if device.type == "cuda" and torch.cuda.is_available() else 0
+        progress_iter.set_postfix({
+            "loss": f"{losses.avg:.4f}",
+            "ce": f"{ce_losses.avg:.4f}",
+            "kl": f"{kl_losses.avg:.4f}",
+            "proto": f"{proto_losses.avg:.4f}",
+            "CUDA-Mem": f"{cuda_mem}%",
+        })
+
+    targs = np.concatenate(targs)
+    probs = np.concatenate(probs_list)
+    preds = np.concatenate(preds_list)
+    auc = auroc(targs, probs)
+    f1, bacc = evaluate_metrics(targs, preds)
+
+    return {
+        "loss": losses.avg,
+        "ce_loss": ce_losses.avg,
+        "kl_loss": kl_losses.avg,
+        "proto_reg_loss": proto_losses.avg,
+        "proto_attract_loss": proto_attract_losses.avg,
+        "proto_separation_loss": proto_separation_losses.avg,
+        "proto_diversity_loss": proto_diversity_losses.avg,
+        "auc_roc": auc,
+        "f1": f1,
+        "bacc": bacc,
+        "lr": optimizer.param_groups[0]["lr"],
+    }
+
+
+def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
+                         criterion, output_path, args, device, valid_split_name="val"):
+    """Full Prototype+EDL training loop across epochs."""
+    best_aucroc = -float("inf")
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_val_stats = None
+    best_checkpoint_path = output_path / "best_model.pth"
+    epochs_without_improvement = 0
+    early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0)))
+    early_stop_min_delta = max(0.0, float(getattr(args, "early_stop_min_delta", 0.0)))
+
+    train_results = {"loss": [], "f1": [], "bacc": [], "auc_roc": [], "lr": []}
+    val_results = {"loss": [], "f1": [], "bacc": [], "auc_roc": []}
+
+    for epoch in range(args.epochs):
+        print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
+        start_time = time.time()
+
+        train_stats = edl_proto_train_fn(
+            train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device
+        )
+        _, _, _, val_stats, _ = edl_valid_fn(
+            valid_loader, model, args, device, split=valid_split_name, epoch=epoch
+        )
+
+        _ = time.time() - start_time
+        valid_display_name = "Test" if valid_split_name == "test" else "Val"
+        print(
+            f"\nTrain Loss: {train_stats['loss']:.4f} | "
+            f"ProtoReg: {train_stats['proto_reg_loss']:.4f} | "
+            f"F1: {train_stats['f1']:.4f} | BAcc: {train_stats['bacc']:.4f} | "
+            f"AUC: {train_stats['auc_roc']:.4f}"
+        )
+        print(
+            f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | "
+            f"F1: {val_stats['f1']:.4f} | BAcc: {val_stats['bacc']:.4f} | "
+            f"AUC: {val_stats['auc_roc']:.4f}"
+        )
+
+        train_results["loss"].append(train_stats["loss"])
+        train_results["f1"].append(train_stats["f1"])
+        train_results["bacc"].append(train_stats["bacc"])
+        train_results["auc_roc"].append(train_stats["auc_roc"])
+        train_results["lr"].append(train_stats["lr"])
+        val_results["loss"].append(val_stats["loss"])
+        val_results["f1"].append(val_stats["f1"])
+        val_results["bacc"].append(val_stats["bacc"])
+        val_results["auc_roc"].append(val_stats["auc_roc"])
+        save_loss_curve(train_results, val_results, output_path)
+
+        val_auc = val_stats["auc_roc"]
+        val_auc_is_valid = np.isfinite(val_auc)
+        annealing_coeff = (
+            criterion.get_annealing_coeff(epoch)
+            if hasattr(criterion, "get_annealing_coeff")
+            else 1.0
+        )
+        annealing_complete = annealing_coeff >= 1.0
+        should_save = (
+            (val_auc_is_valid and val_auc > best_aucroc + early_stop_min_delta)
+            or (not val_auc_is_valid and val_stats["loss"] < best_val_loss - early_stop_min_delta)
+            or best_val_stats is None
+        )
+
+        if should_save:
+            epochs_without_improvement = 0
+            if val_auc_is_valid:
+                best_aucroc = val_auc
+            best_val_loss = val_stats["loss"]
+            best_val_stats = val_stats
+            best_epoch = epoch + 1
+            best_checkpoint_path = output_path / "best_model.pth"
+            if val_auc_is_valid:
+                print(f"Epoch {epoch + 1} - Save best AUC: {best_aucroc:.4f}")
+            else:
+                print(
+                    f"Epoch {epoch + 1} - {valid_display_name} AUC is undefined; "
+                    f"save best validation loss: {best_val_loss:.4f}"
+                )
+            torch.save({
+                "model": model.state_dict(),
+                "epoch": epoch,
+                "auroc": val_stats["auc_roc"],
+                "f1": val_stats["f1"],
+                "bacc": val_stats["bacc"],
+                "dir_path": output_path,
+            }, best_checkpoint_path)
+        elif early_stop_patience > 0 and not annealing_complete:
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if np.isfinite(best_aucroc):
+            print(f"\nBest AUC-ROC at epoch {best_epoch}: {best_aucroc:.4f}")
+        else:
+            print(f"\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f} (AUC undefined)")
+
+        if early_stop_patience > 0:
+            if not annealing_complete:
+                print(
+                    "Early stopping paused until EDL annealing completes "
+                    f"(annealing={annealing_coeff:.3f})."
+                )
+            else:
+                print(
+                    f"Early stopping: {epochs_without_improvement}/"
+                    f"{early_stop_patience} epochs without improvement"
+                )
+                if epochs_without_improvement >= early_stop_patience:
+                    print(
+                        f"Early stopping triggered at epoch {epoch + 1}. "
+                        f"Best epoch: {best_epoch}."
+                    )
+                    break
+
+    torch.cuda.empty_cache()
+    gc.collect()
+    return best_val_stats, best_checkpoint_path
 
 
 @torch.no_grad()
@@ -495,7 +844,7 @@ def do_edl_proto_training(args, device):
             class_weights=class_weights,
         )
 
-        val_stats, best_checkpoint_path = edl_train_loop(
+        val_stats, best_checkpoint_path = edl_proto_train_loop(
             train_loader,
             valid_loader,
             model,
