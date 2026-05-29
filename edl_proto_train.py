@@ -66,6 +66,8 @@ def _add_proto_args(parser):
                         help="Weight for keeping same-class prototypes diverse.")
     parser.add_argument("--edl_proto_margin", default=1.0, type=float,
                         help="Distance margin used by prototype separation/diversity losses.")
+    parser.add_argument("--edl_proto_balance_classes", default="y", choices=["y", "n"],
+                        help="Average prototype attraction/separation by class instead of by sample.")
 
 
 def config():
@@ -169,7 +171,7 @@ def _zero_like_loss(edl_out):
     return edl_out["alpha"].sum() * 0.0
 
 
-def _single_output_proto_reg(edl_out, labels, margin):
+def _single_output_proto_reg(edl_out, labels, margin, balance_classes=True):
     """Sample-prototype attraction and opposite-class separation for one head."""
     if "prototype_distances" not in edl_out:
         zero = _zero_like_loss(edl_out)
@@ -178,25 +180,50 @@ def _single_output_proto_reg(edl_out, labels, margin):
     distances = edl_out["prototype_distances"]
     labels = labels.long()
     batch_idx = torch.arange(labels.size(0), device=labels.device)
+    class_attractions = []
+    class_separations = []
 
-    same_distances = distances[batch_idx, labels]
-    attraction = same_distances.min(dim=-1).values.mean()
+    for class_idx in range(distances.size(1)):
+        class_mask = labels == class_idx
+        if not torch.any(class_mask):
+            continue
 
-    if distances.size(1) == 2:
-        opposite_labels = 1 - labels
-        opposite_distances = distances[batch_idx, opposite_labels]
-        nearest_opposite = opposite_distances.min(dim=-1).values
+        class_distances = distances[class_mask]
+        same_distances = class_distances[:, class_idx]
+        class_attractions.append(same_distances.min(dim=-1).values.mean())
+
+        other_class_mask = torch.ones(distances.size(1), dtype=torch.bool, device=distances.device)
+        other_class_mask[class_idx] = False
+        nearest_opposite = class_distances[:, other_class_mask, :].reshape(
+            class_distances.size(0), -1
+        ).min(dim=-1).values
+        class_separations.append(F.relu(float(margin) - nearest_opposite).mean())
+
+    if not class_attractions:
+        zero = _zero_like_loss(edl_out)
+        return zero, zero, zero
+
+    if balance_classes:
+        attraction = torch.stack(class_attractions).mean()
+        separation = torch.stack(class_separations).mean()
     else:
-        class_mask = torch.ones(
-            distances.size(0),
-            distances.size(1),
-            dtype=torch.bool,
-            device=distances.device,
-        )
-        class_mask[batch_idx, labels] = False
-        nearest_opposite = distances[class_mask].view(distances.size(0), -1).min(dim=-1).values
+        same_distances = distances[batch_idx, labels]
+        attraction = same_distances.min(dim=-1).values.mean()
+        if distances.size(1) == 2:
+            opposite_labels = 1 - labels
+            opposite_distances = distances[batch_idx, opposite_labels]
+            nearest_opposite = opposite_distances.min(dim=-1).values
+        else:
+            sample_class_mask = torch.ones(
+                distances.size(0),
+                distances.size(1),
+                dtype=torch.bool,
+                device=distances.device,
+            )
+            sample_class_mask[batch_idx, labels] = False
+            nearest_opposite = distances[sample_class_mask].view(distances.size(0), -1).min(dim=-1).values
+        separation = F.relu(float(margin) - nearest_opposite).mean()
 
-    separation = F.relu(float(margin) - nearest_opposite).mean()
     return attraction, separation, attraction + separation
 
 
@@ -239,6 +266,9 @@ def prototype_regularization_loss(model, edl_out, labels, args):
     attract_weight = float(getattr(args, "edl_proto_attract_weight", 0.0))
     separation_weight = float(getattr(args, "edl_proto_separation_weight", 0.0))
     diversity_weight = float(getattr(args, "edl_proto_diversity_weight", 0.0))
+    balance_classes = getattr(args, "edl_proto_balance_classes", True)
+    if isinstance(balance_classes, str):
+        balance_classes = balance_classes == "y"
 
     head_outputs = [
         head_out
@@ -259,7 +289,12 @@ def prototype_regularization_loss(model, edl_out, labels, args):
     attractions = []
     separations = []
     for head_out in head_outputs:
-        attraction, separation, _ = _single_output_proto_reg(head_out, labels, margin)
+        attraction, separation, _ = _single_output_proto_reg(
+            head_out,
+            labels,
+            margin,
+            balance_classes=balance_classes,
+        )
         attractions.append(attraction)
         separations.append(separation)
 
@@ -357,6 +392,9 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
             "ce": f"{ce_losses.avg:.4f}",
             "kl": f"{kl_losses.avg:.4f}",
             "proto": f"{proto_losses.avg:.4f}",
+            "attr": f"{proto_attract_losses.avg:.4f}",
+            "sep": f"{proto_separation_losses.avg:.4f}",
+            "div": f"{proto_diversity_losses.avg:.4f}",
             "CUDA-Mem": f"{cuda_mem}%",
         })
 

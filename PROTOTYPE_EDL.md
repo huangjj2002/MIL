@@ -131,7 +131,10 @@ total_loss = EDLCombinedLoss + prototype_regularization
 --edl_proto_separation_weight   default 0.1
 --edl_proto_diversity_weight    default 0.01
 --edl_proto_margin              default 1.0
+--edl_proto_balance_classes     default y
 ```
+
+`--edl_proto_balance_classes y` 表示 attraction / separation 先在 batch 内按类别分别求均值，再对出现的类别平均。这个设置对阳性样本极少的任务很重要，可以避免 prototype 正则几乎完全被 negative class 主导。
 
 如果想先观察纯 Prototype + EDL head 的效果，可以把三个 weight 都设为 `0`。如果 prototype 解释性弱或出现塌缩，可以优先提高 `--edl_proto_diversity_weight` 或 `--edl_proto_separation_weight`。
 
@@ -155,7 +158,8 @@ python edl_proto_train.py \
   --edl_proto_attract_weight 0.1 \
   --edl_proto_separation_weight 0.1 \
   --edl_proto_diversity_weight 0.01 \
-  --edl_proto_margin 1.0
+  --edl_proto_margin 1.0 \
+  --edl_proto_balance_classes y
 ```
 
 单独测试已有 Prototype + EDL checkpoint：
