@@ -57,6 +57,17 @@ def config():
     parser.add_argument('--edl_annealing_epochs', type=int, default=10)
     parser.add_argument('--edl_annealing_start', type=int, default=0)
     parser.add_argument('--edl_dropout', type=float, default=0.0)
+    parser.add_argument('--edl_focal_gamma', '--edl-focal-gamma', dest='edl_focal_gamma',
+                        type=float, default=0.0)
+    parser.add_argument('--edl_wrong_evidence_penalty_weight', '--edl-wrong-evidence-penalty-weight',
+                        dest='edl_wrong_evidence_penalty_weight', type=float, default=0.0)
+    parser.add_argument('--edl_wrong_evidence_margin', '--edl-wrong-evidence-margin',
+                        dest='edl_wrong_evidence_margin', type=float, default=0.05)
+    parser.add_argument('--edl_wrong_evidence_class_balanced', '--edl-wrong-evidence-class-balanced',
+                        dest='edl_wrong_evidence_class_balanced', default='y', choices=['y', 'n'])
+    parser.add_argument('--edl_loss_weight_normalization', '--edl-loss-weight-normalization',
+                        dest='edl_loss_weight_normalization', default='legacy_mean',
+                        choices=['legacy_mean', 'weighted_mean'])
     
     # ===== Data settings =====
     parser.add_argument("--gpu_id", type=str, default="0")
@@ -66,7 +77,8 @@ def config():
     parser.add_argument("--clip_chk_pt_path", default=None, type=str,
                         help="Path to Mammo-CLIP checkpoint; required when --feature_extraction online")
     parser.add_argument('--train', action='store_true', default=False)
-    parser.add_argument("--img-size", nargs='+', default=[1520, 912])
+    parser.add_argument("--img-size", "--img_size", dest="img_size", nargs='+',
+                        type=int, default=[1520, 912])
     parser.add_argument("--dataset", default="ViNDr", type=str)
     parser.add_argument("--label", default="Mass", type=str)
     parser.add_argument("--num-classes", default=1, type=int)

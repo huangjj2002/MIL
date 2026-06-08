@@ -33,7 +33,8 @@ def config():
     parser.add_argument('--eval_set', default='test', choices = ['val', 'test', 'all'], type=str, help="Evaluation split: val, test, or all (ignore split column).")
     
     # Data settings
-    parser.add_argument("--img-size", nargs='+', default=[1520, 912])
+    parser.add_argument("--img-size", "--img_size", dest="img_size", nargs='+',
+                        type=int, default=[1520, 912])
     parser.add_argument("--dataset", default="ViNDr", type=str, help="Dataset name.")
     parser.add_argument("--data_frac", default=1.0, type=float, help="Fraction of data to be used for training")
     parser.add_argument("--label", default="Mass", type=str, help="Mass or Suspicious_Calcification")

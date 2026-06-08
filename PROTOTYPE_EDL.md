@@ -136,6 +136,44 @@ total_loss = EDLCombinedLoss + prototype_regularization
 
 `--edl_proto_balance_classes y` 表示 attraction / separation 先在 batch 内按类别分别求均值，再对出现的类别平均。这个设置对阳性样本极少的任务很重要，可以避免 prototype 正则几乎完全被 negative class 主导。
 
+### Optional EDL loss knobs
+
+The EDL and Prototype+EDL training scripts share the same optional EDL loss
+controls. Defaults preserve the current MIL behavior:
+
+```bash
+# legacy behavior: omit all of these flags
+
+# enable wrong-direction high-evidence penalty
+--edl_wrong_evidence_penalty_weight 0.01 \
+--edl_wrong_evidence_margin 0.05 \
+--edl_wrong_evidence_class_balanced y
+
+# optional Mammo-CLIP-style weighted denominator
+--edl_loss_weight_normalization weighted_mean
+
+# optional focal modulation; default 0.0 keeps it off
+--edl_focal_gamma 1.0
+```
+
+`legacy_mean` keeps the old weighted CE behavior. Use `weighted_mean` only when
+you intentionally want the Mammo-CLIP-style weighted denominator for comparison.
+
+### Original MIL image / patch size
+
+Prototype-EDL inherits the same size parser as EDL. To match the original online
+MIL setting explicitly, include:
+
+```bash
+--img-size 1520 912 \
+--patch_size 512 \
+--overlap 0.0 \
+--scales 16 32 128
+```
+
+The full default scale list from `main.py` remains `16 32 64 128`; the common
+FPN experiment command uses `16 32 128`.
+
 如果想先观察纯 Prototype + EDL head 的效果，可以把三个 weight 都设为 `0`。如果 prototype 解释性弱或出现塌缩，可以优先提高 `--edl_proto_diversity_weight` 或 `--edl_proto_separation_weight`。
 
 ## 当前项目用法

@@ -32,14 +32,15 @@ def config():
     # --- Patch Extraction Settings ---
     parser.add_argument('--patching', action = 'store_true', default = False, help = 'Wether to perform patching on full-resolution images. If false, it will consider previously extracted patches that were saved in a directory (default: False)')
     parser.add_argument('--source_image', type = str, default = 'patches', choices = ['patches', 'full_image'])
-    parser.add_argument('--patch_size', type = int, default = 224, help='Patch size for image cropping') 
+    parser.add_argument('--patch_size', type = int, default = 512, help='Patch size for image cropping')
     #parser.add_argument('--overlap', type = float, default = 0.0)
-    parser.add_argument('--overlap', type = float, nargs='*',  default=(0.0), help='Overlap between patches (if any)')
-    parser.add_argument('--scales', type=int,  nargs='*',  default=(4, 8, 16, 32), help="List of scales to use for the Feature Pyramid Network (FPN). Default: (2, 4, 16, 32).")
+    parser.add_argument('--overlap', type = float, nargs='*',  default=[0.0], help='Overlap between patches (if any)')
+    parser.add_argument('--scales', type=int,  nargs='*',  default=(16, 32, 64, 128), help="List of scales to use for the Feature Pyramid Network (FPN). Default: (16, 32, 64, 128).")
     parser.add_argument('--multi_scale_model', type=str, choices = ['fpn', 'backbone_pyramid', 'image_pyramid'], default = None, help='Type of multiscale model') 
     
     # --- Dataset Settings ---
-    parser.add_argument("--img-size", nargs='+', default=[1520, 912], help="Image size in pixels (H, W)")
+    parser.add_argument("--img-size", "--img_size", dest="img_size", nargs='+',
+                        type=int, default=[1520, 912], help="Image size in pixels (H, W)")
     parser.add_argument("--data_frac", default=1.0, type=float, help="Fraction of data to be used for training")
     parser.add_argument("--dataset", default="VinDr", type=str, help="Dataset name")
     parser.add_argument("--mean", default=0.3089279, type=float, help="Dataset mean for normalization")
@@ -52,9 +53,18 @@ def config():
 
     # --- Mammo-CLIP settings ---
     parser.add_argument('--model-type', default="Classifier", type=str, help='Model task type')
-    parser.add_argument("--arch", default="upmc_breast_clip_det_b5_period_n_ft", type=str,
-        help="For b5 classification, [upmc_breast_clip_det_b5_period_n_lp for linear probe and  upmc_breast_clip_det_b5_period_n_ft for finetuning]. "
-             "For b2 classification, [upmc_breast_clip_det_b2_period_n_lp for linear probe and  upmc_breast_clip_det_b2_period_n_ft for finetuning].", help="Model architecture name")
+    parser.add_argument(
+        "--arch",
+        default="upmc_breast_clip_det_b5_period_n_ft",
+        type=str,
+        help=(
+            "Model architecture name. For b5 classification, use "
+            "upmc_breast_clip_det_b5_period_n_lp or "
+            "upmc_breast_clip_det_b5_period_n_ft. For b2 classification, use "
+            "upmc_breast_clip_det_b2_period_n_lp or "
+            "upmc_breast_clip_det_b2_period_n_ft."
+        ),
+    )
     parser.add_argument("--swin_encoder", default="microsoft/swin-tiny-patch4-window7-224", type=str, help="Swin Transformer model identifier")
     parser.add_argument("--pretrained_swin_encoder", default="y", type=str, help="Whether Swin encoder is pretrained (y/n)")
     parser.add_argument("--swin_model_type", default="y", type=str)
@@ -235,7 +245,5 @@ def main(args):
 if __name__ == "__main__":
     args = config()
     main(args)
-
-
 
 

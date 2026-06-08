@@ -89,3 +89,51 @@
    
    
 
+## Optional EDL loss knobs
+
+`edl_train.py` and `edl_proto_train.py` support optional Mammo-CLIP-style EDL
+loss controls. Defaults preserve the current MIL behavior, so omit these flags
+for legacy comparisons.
+
+```bash
+# enable wrong-direction high-evidence penalty
+--edl_wrong_evidence_penalty_weight 0.01 \
+--edl_wrong_evidence_margin 0.05 \
+--edl_wrong_evidence_class_balanced y
+
+# optional Mammo-CLIP-style weighted denominator
+--edl_loss_weight_normalization weighted_mean
+
+# optional focal modulation; default 0.0 keeps it off
+--edl_focal_gamma 1.0
+```
+
+Use `--edl_loss_weight_normalization legacy_mean` or omit it to keep the old
+weighted CE reduction. Use `weighted_mean` only for explicit Mammo-CLIP-style
+loss ablations.
+
+## Original MIL image / patch size
+
+The EDL and Prototype-EDL entrypoints now use the same online MIL size defaults
+as `main.py`:
+
+```bash
+--img-size 1520 912 \
+--patch_size 512 \
+--overlap 0.0 \
+--scales 16 32 64 128
+```
+
+For the best-performing FPN MIL setting used in the examples, keep the explicit
+three-scale setting:
+
+```bash
+--img-size 1520 912 \
+--patch_size 512 \
+--overlap 0.0 \
+--scales 16 32 128
+```
+
+`offline_feature_extraction.py` was also aligned to `patch_size=512` by default,
+so feature extraction and online EDL training no longer silently disagree on
+224-vs-512 patch crops.

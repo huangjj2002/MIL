@@ -56,6 +56,22 @@ def config():
     parser.add_argument('--edl_annealing_epochs', type=int, default=10, help='Number of epochs for KL annealing')
     parser.add_argument('--edl_annealing_start', type=int, default=0, help='Epoch to start KL annealing')
     parser.add_argument('--edl_dropout', type=float, default=0.0, help='Dropout for EDL head')
+    parser.add_argument('--edl_focal_gamma', '--edl-focal-gamma', dest='edl_focal_gamma',
+                        type=float, default=0.0,
+                        help='Optional focal modulation for the EDL data loss. 0 preserves legacy behavior.')
+    parser.add_argument('--edl_wrong_evidence_penalty_weight', '--edl-wrong-evidence-penalty-weight',
+                        dest='edl_wrong_evidence_penalty_weight', type=float, default=0.0,
+                        help='Weight for wrong-direction high-evidence penalty. 0 disables it.')
+    parser.add_argument('--edl_wrong_evidence_margin', '--edl-wrong-evidence-margin',
+                        dest='edl_wrong_evidence_margin', type=float, default=0.05,
+                        help='Probability margin for wrong-evidence penalty.')
+    parser.add_argument('--edl_wrong_evidence_class_balanced', '--edl-wrong-evidence-class-balanced',
+                        dest='edl_wrong_evidence_class_balanced', default='y', choices=['y', 'n'],
+                        help='Average wrong-evidence penalty by class before reducing.')
+    parser.add_argument('--edl_loss_weight_normalization', '--edl-loss-weight-normalization',
+                        dest='edl_loss_weight_normalization', default='legacy_mean',
+                        choices=['legacy_mean', 'weighted_mean'],
+                        help='legacy_mean preserves current MIL weighted CE; weighted_mean matches Mammo-CLIP style.')
     parser.add_argument('--train_edl_only', '--freeze_backbone', action='store_true', default=False,
                         help='Freeze the MIL backbone and train only EDL head(s)')
     
@@ -71,7 +87,8 @@ def config():
     parser.add_argument('--train', action='store_true', default=True)
     
     # ===== Data settings =====
-    parser.add_argument("--img-size", nargs='+', default=[1520, 912])
+    parser.add_argument("--img-size", "--img_size", dest="img_size", nargs='+',
+                        type=int, default=[1520, 912])
     parser.add_argument("--dataset", default="ViNDr", type=str)
     parser.add_argument("--data_frac", default=1.0, type=float)
     parser.add_argument("--label", default="Mass", type=str)
@@ -334,6 +351,95 @@ def keep_frozen_mil_backbone_in_eval(model, args):
         model.mil_model.eval()
 
 
+EDL_LOSS_DIAGNOSTIC_KEYS = [
+    'ce_loss',
+    'data_loss',
+    'unweighted_ce_loss',
+    'class_weighted_ce_loss',
+    'focal_ce_loss',
+    'kl_loss',
+    'annealing',
+    'wrong_evidence_penalty',
+    'margin_violation_mean',
+    'total_evidence_mean',
+    'focal_factor_mean',
+    'sample_weight_mean',
+    'focal_weighted_denominator',
+    'total_loss',
+    'class0_ce_loss_mean',
+    'class0_weighted_ce_loss_mean',
+    'class0_focal_weighted_ce_loss_mean',
+    'class0_focal_factor_mean',
+    'class0_wrong_evidence_penalty_mean',
+    'class1_ce_loss_mean',
+    'class1_weighted_ce_loss_mean',
+    'class1_focal_weighted_ce_loss_mean',
+    'class1_focal_factor_mean',
+    'class1_wrong_evidence_penalty_mean',
+]
+
+
+def build_edl_criterion(args, class_weights=None):
+    return EDLCombinedLoss(
+        num_classes=2,
+        kl_weight=args.edl_kl_weight,
+        annealing_start=args.edl_annealing_start,
+        annealing_epochs=args.edl_annealing_epochs,
+        class_weights=class_weights,
+        focal_gamma=getattr(args, 'edl_focal_gamma', 0.0),
+        wrong_evidence_penalty_weight=getattr(args, 'edl_wrong_evidence_penalty_weight', 0.0),
+        wrong_evidence_margin=getattr(args, 'edl_wrong_evidence_margin', 0.05),
+        wrong_evidence_class_balanced=getattr(args, 'edl_wrong_evidence_class_balanced', 'y'),
+        loss_weight_normalization=getattr(args, 'edl_loss_weight_normalization', 'legacy_mean'),
+    )
+
+
+def _new_loss_meters():
+    return {key: AverageMeter() for key in EDL_LOSS_DIAGNOSTIC_KEYS}
+
+
+def _is_finite_number(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _update_loss_meters(meters, loss_dict, batch_size):
+    for key, meter in meters.items():
+        value = loss_dict.get(key)
+        if value is None or not _is_finite_number(value):
+            continue
+        weight = batch_size
+        if key.startswith('class0_'):
+            weight = int(loss_dict.get('class0_n', 0))
+        elif key.startswith('class1_'):
+            weight = int(loss_dict.get('class1_n', 0))
+        if weight > 0:
+            meter.update(float(value), weight)
+
+
+def _loss_meter_averages(meters):
+    return {key: meter.avg for key, meter in meters.items() if meter.count > 0}
+
+
+def _append_epoch_stats(history, stats):
+    for key in history:
+        if key in stats:
+            history[key].append(stats[key])
+        elif key not in {'loss', 'f1', 'bacc', 'auc_roc', 'lr'}:
+            history[key].append(float('nan'))
+
+
+def _init_epoch_history(include_lr=False):
+    history = {'loss': [], 'f1': [], 'bacc': [], 'auc_roc': []}
+    if include_lr:
+        history['lr'] = []
+    for key in EDL_LOSS_DIAGNOSTIC_KEYS:
+        history[key] = []
+    return history
+
+
 def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device):
     """Training loop for one epoch with EDL loss."""
     
@@ -344,6 +450,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     losses = AverageMeter()
     ce_losses = AverageMeter()
     kl_losses = AverageMeter()
+    loss_meters = _new_loss_meters()
     
     progress_iter = tqdm(enumerate(train_loader),
                          desc=f"[{epoch + 1:03d}/{args.epochs:03d} EDL train]",
@@ -382,6 +489,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         losses.update(loss.item(), batch_size)
         ce_losses.update(loss_dict['ce_loss'], batch_size)
         kl_losses.update(loss_dict['kl_loss'], batch_size)
+        _update_loss_meters(loss_meters, loss_dict, batch_size)
         
         # Backprop
         scaler.scale(loss).backward()
@@ -410,6 +518,9 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
             "loss": f"{losses.avg:.4f}",
             "ce": f"{ce_losses.avg:.4f}",
             "kl": f"{kl_losses.avg:.4f}",
+            "wep": f"{loss_meters['wrong_evidence_penalty'].avg:.4f}",
+            "viol": f"{loss_meters['margin_violation_mean'].avg:.4f}",
+            "evid": f"{loss_meters['total_evidence_mean'].avg:.4f}",
             "CUDA-Mem": f"{cuda_mem}%",
         })
     
@@ -430,6 +541,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         'bacc': bacc,
         'lr': optimizer.param_groups[0]['lr'],
     }
+    train_stats.update(_loss_meter_averages(loss_meters))
     
     return train_stats
 
@@ -442,12 +554,8 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
     model.is_training = False
     
     losses = AverageMeter()
-    criterion_eval = EDLCombinedLoss(
-        num_classes=2,
-        kl_weight=args.edl_kl_weight,
-        annealing_start=args.edl_annealing_start,
-        annealing_epochs=args.edl_annealing_epochs,
-    )
+    criterion_eval = build_edl_criterion(args, class_weights=None)
+    loss_meters = _new_loss_meters()
     
     targs = []
     probs_list = []
@@ -485,12 +593,13 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             edl_out = model(inputs)
             alpha = edl_out['alpha']
-            loss, _ = criterion_eval(alpha, labels, epoch=epoch)
+            loss, loss_dict = criterion_eval(alpha, labels, epoch=epoch)
             for side_out in edl_out.get('side_outputs', {}).values():
                 side_loss, _ = criterion_eval(side_out['alpha'], labels, epoch=epoch)
                 loss = loss + side_loss
         
         losses.update(loss.item(), batch_size)
+        _update_loss_meters(loss_meters, loss_dict, batch_size)
         
         prob = edl_out['prob'].detach()
         pred_class = torch.argmax(prob, dim=-1)
@@ -517,6 +626,7 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
         'f1': f1,
         'bacc': bacc,
     }
+    val_stats.update(_loss_meter_averages(loss_meters))
     
     sample_results = {
         'patient_id': sample_patient_ids,
@@ -540,7 +650,8 @@ def save_loss_curve(train_results, val_results, output_path):
         return
 
     output_path = Path(output_path)
-    curve_df = pd.DataFrame({
+    n_epochs = len(train_results['loss'])
+    curve_data = {
         'epoch': np.arange(1, len(train_results['loss']) + 1),
         'train_loss': train_results['loss'],
         'val_loss': val_results['loss'],
@@ -551,7 +662,15 @@ def save_loss_curve(train_results, val_results, output_path):
         'train_bacc': train_results['bacc'],
         'val_bacc': val_results['bacc'],
         'lr': train_results['lr'],
-    })
+    }
+    base_keys = {'loss', 'auc_roc', 'f1', 'bacc', 'lr'}
+    for key, values in train_results.items():
+        if key not in base_keys and len(values) == n_epochs:
+            curve_data[f'train_{key}'] = values
+    for key, values in val_results.items():
+        if key not in base_keys and len(values) == n_epochs:
+            curve_data[f'val_{key}'] = values
+    curve_df = pd.DataFrame(curve_data)
     curve_df.to_csv(output_path / 'edl_loss_curve.csv', index=False)
 
     try:
@@ -601,8 +720,8 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
     early_stop_patience = max(0, int(getattr(args, 'early_stop_patience', 0)))
     early_stop_min_delta = max(0.0, float(getattr(args, 'early_stop_min_delta', 0.0)))
     
-    train_results = {'loss': [], 'f1': [], 'bacc': [], 'auc_roc': [], 'lr': []}
-    val_results = {'loss': [], 'f1': [], 'bacc': [], 'auc_roc': []}
+    train_results = _init_epoch_history(include_lr=True)
+    val_results = _init_epoch_history(include_lr=False)
     
     for epoch in range(args.epochs):
         print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
@@ -621,16 +740,8 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         print(f"\nTrain Loss: {train_stats['loss']:.4f} | F1: {train_stats['f1']:.4f} | BAcc: {train_stats['bacc']:.4f} | AUC: {train_stats['auc_roc']:.4f}")
         print(f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | F1: {val_stats['f1']:.4f} | BAcc: {val_stats['bacc']:.4f} | AUC: {val_stats['auc_roc']:.4f}")
         
-        train_results['loss'].append(train_stats['loss'])
-        train_results['f1'].append(train_stats['f1'])
-        train_results['bacc'].append(train_stats['bacc'])
-        train_results['auc_roc'].append(train_stats['auc_roc'])
-        train_results['lr'].append(train_stats['lr'])
-        
-        val_results['loss'].append(val_stats['loss'])
-        val_results['f1'].append(val_stats['f1'])
-        val_results['bacc'].append(val_stats['bacc'])
-        val_results['auc_roc'].append(val_stats['auc_roc'])
+        _append_epoch_stats(train_results, train_stats)
+        _append_epoch_stats(val_results, val_stats)
         save_loss_curve(train_results, val_results, output_path)
         
         # Save best model. AUC is undefined when the validation fold contains
@@ -838,13 +949,7 @@ def do_edl_training(args, device):
         if getattr(args, 'weighted_BCE', 'n') == 'y':
             class_weights = get_edl_class_weights(train_df, args.label)
 
-        criterion = EDLCombinedLoss(
-            num_classes=2,
-            kl_weight=args.edl_kl_weight,
-            annealing_start=args.edl_annealing_start,
-            annealing_epochs=args.edl_annealing_epochs,
-            class_weights=class_weights,
-        )
+        criterion = build_edl_criterion(args, class_weights=class_weights)
         
         # Train
         val_stats, best_checkpoint_path = edl_train_loop(
@@ -860,6 +965,9 @@ def do_edl_training(args, device):
             'loss': val_stats['loss'],
             'eval_source': 'internal_val' if single_internal_val else 'cross_val',
         }
+        for key in EDL_LOSS_DIAGNOSTIC_KEYS:
+            if key in val_stats:
+                fold_summary[key] = val_stats[key]
         all_val_results.append(fold_summary)
         
         # Load best model and generate predictions for all splits

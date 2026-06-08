@@ -25,12 +25,18 @@ from tqdm import tqdm
 
 from Datasets.dataset_utils import MIL_dataloader
 from MIL import build_model
-from MIL.edl_losses import EDLCombinedLoss
 from MIL.edl_proto_models import MIL_EDL_Prototype_Wrapper
 from edl_train import (
     LinearWarmupCosineAnnealingLR,
+    EDL_LOSS_DIAGNOSTIC_KEYS,
+    _append_epoch_stats,
     _get_checkpoint_state_dict,
+    _init_epoch_history,
+    _loss_meter_averages,
+    _new_loss_meters,
     _print_load_summary,
+    _update_loss_meters,
+    build_edl_criterion,
     config as base_edl_config,
     edl_valid_fn,
     freeze_mil_backbone_train_edl_only,
@@ -334,6 +340,7 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
     proto_attract_losses = AverageMeter()
     proto_separation_losses = AverageMeter()
     proto_diversity_losses = AverageMeter()
+    loss_meters = _new_loss_meters()
 
     progress_iter = tqdm(
         enumerate(train_loader),
@@ -365,6 +372,7 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
         losses.update(loss.item(), batch_size)
         ce_losses.update(loss_dict["ce_loss"], batch_size)
         kl_losses.update(loss_dict["kl_loss"], batch_size)
+        _update_loss_meters(loss_meters, loss_dict, batch_size)
         proto_losses.update(float(proto_dict["proto_reg"].item()), batch_size)
         proto_attract_losses.update(float(proto_dict["proto_attract"].item()), batch_size)
         proto_separation_losses.update(float(proto_dict["proto_separate"].item()), batch_size)
@@ -391,6 +399,9 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
             "loss": f"{losses.avg:.4f}",
             "ce": f"{ce_losses.avg:.4f}",
             "kl": f"{kl_losses.avg:.4f}",
+            "wep": f"{loss_meters['wrong_evidence_penalty'].avg:.4f}",
+            "viol": f"{loss_meters['margin_violation_mean'].avg:.4f}",
+            "evid": f"{loss_meters['total_evidence_mean'].avg:.4f}",
             "proto": f"{proto_losses.avg:.4f}",
             "attr": f"{proto_attract_losses.avg:.4f}",
             "sep": f"{proto_separation_losses.avg:.4f}",
@@ -404,7 +415,7 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
     auc = auroc(targs, probs)
     f1, bacc = evaluate_metrics(targs, preds)
 
-    return {
+    train_stats = {
         "loss": losses.avg,
         "ce_loss": ce_losses.avg,
         "kl_loss": kl_losses.avg,
@@ -417,6 +428,8 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
         "bacc": bacc,
         "lr": optimizer.param_groups[0]["lr"],
     }
+    train_stats.update(_loss_meter_averages(loss_meters))
+    return train_stats
 
 
 def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
@@ -431,8 +444,15 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
     early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0)))
     early_stop_min_delta = max(0.0, float(getattr(args, "early_stop_min_delta", 0.0)))
 
-    train_results = {"loss": [], "f1": [], "bacc": [], "auc_roc": [], "lr": []}
-    val_results = {"loss": [], "f1": [], "bacc": [], "auc_roc": []}
+    train_results = _init_epoch_history(include_lr=True)
+    val_results = _init_epoch_history(include_lr=False)
+    for key in [
+        "proto_reg_loss",
+        "proto_attract_loss",
+        "proto_separation_loss",
+        "proto_diversity_loss",
+    ]:
+        train_results[key] = []
 
     for epoch in range(args.epochs):
         print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
@@ -459,15 +479,8 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
             f"AUC: {val_stats['auc_roc']:.4f}"
         )
 
-        train_results["loss"].append(train_stats["loss"])
-        train_results["f1"].append(train_stats["f1"])
-        train_results["bacc"].append(train_stats["bacc"])
-        train_results["auc_roc"].append(train_stats["auc_roc"])
-        train_results["lr"].append(train_stats["lr"])
-        val_results["loss"].append(val_stats["loss"])
-        val_results["f1"].append(val_stats["f1"])
-        val_results["bacc"].append(val_stats["bacc"])
-        val_results["auc_roc"].append(val_stats["auc_roc"])
+        _append_epoch_stats(train_results, train_stats)
+        _append_epoch_stats(val_results, val_stats)
         save_loss_curve(train_results, val_results, output_path)
 
         val_auc = val_stats["auc_roc"]
@@ -874,13 +887,7 @@ def do_edl_proto_training(args, device):
         if getattr(args, "weighted_BCE", "n") == "y":
             class_weights = get_edl_class_weights(train_df, args.label)
 
-        criterion = EDLCombinedLoss(
-            num_classes=2,
-            kl_weight=args.edl_kl_weight,
-            annealing_start=args.edl_annealing_start,
-            annealing_epochs=args.edl_annealing_epochs,
-            class_weights=class_weights,
-        )
+        criterion = build_edl_criterion(args, class_weights=class_weights)
 
         val_stats, best_checkpoint_path = edl_proto_train_loop(
             train_loader,
@@ -904,6 +911,9 @@ def do_edl_proto_training(args, device):
             "loss": val_stats["loss"],
             "eval_source": "internal_val" if single_internal_val else "cross_val",
         }
+        for key in EDL_LOSS_DIAGNOSTIC_KEYS:
+            if key in val_stats:
+                fold_summary[key] = val_stats[key]
         all_val_results.append(fold_summary)
 
         print(f"\nGenerating Prototype+EDL predictions with best model for fold {fold}...")
