@@ -1,16 +1,4 @@
-"""
-EDL Test Script - Evidential Deep Learning Inference
 
-Loads the trained EDL models from each fold, performs predictions on all data,
-and generates a unified CSV with evidence, alpha, uncertainty, and fold columns.
-
-The script reproduces the same k-fold splits used during training to determine
-which fold model should be used for each validation sample. For test data, 
-all fold models predict and results are aggregated.
-
-Usage:
-    python edl_test.py --checkpoint_dir path/to/edl_output --data_dir datasets/... --csv_file grouped_df.csv
-"""
 
 import os
 import gc

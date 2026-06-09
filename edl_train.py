@@ -1,17 +1,4 @@
-"""
-EDL Training Script - Evidential Deep Learning with MIL
 
-This script performs fine-tuning of a pretrained MIL model with an EDL head,
-using 5-fold cross-validation. It loads pretrained MIL weights, replaces the
-classification head with an EDL head, and can either train all parameters or
-freeze the MIL backbone and train only the EDL module.
-
-Usage:
-    python edl_train.py --resume path/to/pretrained_mil --data_dir datasets/... --csv_file grouped_df.csv
-    
-All arguments mirror the original main.py to ensure compatibility with the MIL model builder.
-Additional EDL-specific arguments are provided for loss configuration.
-"""
 
 import os
 import sys
@@ -206,7 +193,7 @@ def config():
 
 
 def resolve_mil_checkpoint(resume_path, fold=None):
-    """Resolve a pretrained MIL checkpoint from a file or experiment directory."""
+
     if resume_path is None:
         return None
 
@@ -233,14 +220,14 @@ def resolve_mil_checkpoint(resume_path, fold=None):
 
 
 def _get_checkpoint_state_dict(checkpoint):
-    """Return the model state dict from a torch checkpoint or raw state dict."""
+
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         return checkpoint['model']
     return checkpoint
 
 
 def _looks_like_edl_state_dict(state_dict):
-    """EDL checkpoints are saved from MIL_EDL_Wrapper and have wrapper prefixes."""
+
     if not isinstance(state_dict, dict):
         return False
     return any(
@@ -260,7 +247,7 @@ def _print_load_summary(prefix, load_msg):
 
 
 class LinearWarmupCosineAnnealingLR(LambdaLR):
-    """Linear warmup + cosine annealing learning rate scheduler."""
+
     def __init__(self, optimizer, total_steps, warmup_steps, last_epoch=-1):
         assert warmup_steps < total_steps, "Warmup steps should be less than total steps."
         self.tsteps = total_steps
@@ -275,16 +262,7 @@ class LinearWarmupCosineAnnealingLR(LambdaLR):
 
 
 def build_edl_model(args, checkpoint_path=None):
-    """
-    Build MIL model, optionally load pretrained weights, wrap with EDL head.
-    
-    Args:
-        args: configuration namespace
-        checkpoint_path: path to pretrained MIL checkpoint
-    
-    Returns:
-        MIL_EDL_Wrapper model
-    """
+
     args.n_class = 1
     if args.feature_extraction == 'online' and not getattr(args, 'clip_chk_pt_path', None):
         raise ValueError(
@@ -303,19 +281,15 @@ def build_edl_model(args, checkpoint_path=None):
         else:
             print(f"[EDL] Warning: checkpoint not found at {checkpoint_path}, training from scratch.")
 
-    # Plain MIL checkpoints are loaded before wrapping because their keys match
-    # the raw MIL model. The EDL head is then initialized from scratch.
     is_edl_checkpoint = _looks_like_edl_state_dict(checkpoint_state)
     if checkpoint_state is not None and not is_edl_checkpoint:
         load_msg = mil_model.load_state_dict(checkpoint_state, strict=False)
         print(f"[EDL] Loaded pretrained MIL backbone from: {checkpoint_path}")
         _print_load_summary("[EDL][MIL load]", load_msg)
 
-    # Wrap with EDL head
     edl_model = MIL_EDL_Wrapper(mil_model, edl_dropout=args.edl_dropout)
     if checkpoint_state is not None and is_edl_checkpoint:
-        # Trained EDL checkpoints already include mil_model.* and edl_head.*
-        # weights, so load them after the wrapper exists.
+
         load_msg = edl_model.load_state_dict(checkpoint_state, strict=False)
         print(f"[EDL] Loaded EDL training checkpoint from: {checkpoint_path}")
         _print_load_summary("[EDL][EDL load]", load_msg)
@@ -324,13 +298,7 @@ def build_edl_model(args, checkpoint_path=None):
 
 
 def freeze_mil_backbone_train_edl_only(model):
-    """
-    Freeze the wrapped MIL model and keep only EDL head parameters trainable.
 
-    The original MIL classifier stays inside model.mil_model but is bypassed by
-    MIL_EDL_Wrapper, so the trainable surface is the main EDL head plus optional
-    scale-specific EDL side heads.
-    """
     for param in model.mil_model.parameters():
         param.requires_grad = False
 
@@ -346,7 +314,7 @@ def freeze_mil_backbone_train_edl_only(model):
 
 
 def keep_frozen_mil_backbone_in_eval(model, args):
-    """Keep frozen backbone modules deterministic while EDL heads remain trainable."""
+
     if getattr(args, 'train_edl_only', False):
         model.mil_model.eval()
 
@@ -441,7 +409,7 @@ def _init_epoch_history(include_lr=False):
 
 
 def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device):
-    """Training loop for one epoch with EDL loss."""
+
     
     model.train()
     keep_frozen_mil_backbone_in_eval(model, args)
@@ -462,7 +430,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     uncertainty_list = []
     
     for step, data in progress_iter:
-        # Move data to device
+      
         if isinstance(data['x'], dict):
             inputs = {scale: tensor.to(device) for scale, tensor in data['x'].items()}
         elif isinstance(data['x'], list):
@@ -470,17 +438,17 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         else:
             inputs = data['x'].to(device)
         
-        labels = data['y'].long().to(device)  # EDL needs integer labels
+        labels = data['y'].long().to(device)  
         batch_size = labels.size(0)
         
         amp_enabled = args.apex and device.type == 'cuda'
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            # Forward pass through EDL wrapper
+        
             edl_out = model(inputs)
             
             alpha = edl_out['alpha']  # (B, K)
             
-            # Compute EDL loss
+        
             loss, loss_dict = criterion(alpha, labels, epoch=epoch)
             for side_out in edl_out.get('side_outputs', {}).values():
                 side_loss, _ = criterion(side_out['alpha'], labels, epoch=epoch)
@@ -491,7 +459,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         kl_losses.update(loss_dict['kl_loss'], batch_size)
         _update_loss_meters(loss_meters, loss_dict, batch_size)
         
-        # Backprop
+       
         scaler.scale(loss).backward()
         
         if args.clip_grad > 0.0:
@@ -503,13 +471,13 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         optimizer.zero_grad()
         scheduler.step()
         
-        # Collect predictions
+   
         prob = edl_out['prob'].detach()  # (B, K)
         pred_class = torch.argmax(prob, dim=-1)  # (B,)
         uncertainty = edl_out['uncertainty'].detach()  # (B,)
         
         targs.append(labels.cpu().numpy())
-        probs_list.append(prob[:, 1].cpu().numpy())  # positive class probability
+        probs_list.append(prob[:, 1].cpu().numpy())  
         preds_list.append(pred_class.cpu().numpy())
         uncertainty_list.append(uncertainty.cpu().numpy())
         cuda_mem = torch.cuda.memory_usage(device) if device.type == 'cuda' and torch.cuda.is_available() else 0
@@ -524,7 +492,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
             "CUDA-Mem": f"{cuda_mem}%",
         })
     
-    # Compute metrics
+
     targs = np.concatenate(targs)
     probs = np.concatenate(probs_list)
     preds = np.concatenate(preds_list)
@@ -548,7 +516,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
 
 @torch.no_grad()
 def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
-    """Validation loop for EDL model."""
+ 
     
     model.eval()
     model.is_training = False
@@ -645,7 +613,7 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
 
 
 def save_loss_curve(train_results, val_results, output_path):
-    """Save epoch-wise loss history as CSV and PNG in the fold output folder."""
+
     if not train_results['loss'] or not val_results['loss']:
         return
 
@@ -694,7 +662,7 @@ def save_loss_curve(train_results, val_results, output_path):
 
 
 def get_edl_class_weights(train_df, label_col):
-    """Return [negative_weight, positive_weight] using neg/pos for class imbalance."""
+
     labels = train_df[label_col].astype(int)
     num_pos = int((labels == 1).sum())
     num_neg = int((labels == 0).sum())
@@ -709,7 +677,7 @@ def get_edl_class_weights(train_df, label_col):
 
 def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler, 
                    criterion, output_path, args, device, valid_split_name='val'):
-    """Full training loop across all epochs."""
+ 
     
     best_aucroc = -float('inf')
     best_val_loss = float('inf')
@@ -727,10 +695,10 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
         start_time = time.time()
         
-        # Train
+        
         train_stats = edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device)
         
-        # Validate
+     
         val_targs, val_preds, val_probs, val_stats, _ = edl_valid_fn(
             valid_loader, model, args, device, split=valid_split_name, epoch=epoch)
         
@@ -744,10 +712,7 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         _append_epoch_stats(val_results, val_stats)
         save_loss_curve(train_results, val_results, output_path)
         
-        # Save best model. AUC is undefined when the validation fold contains
-        # only one class, which can happen with very rare positives and grouped
-        # k-fold splitting. Fall back to validation loss in that case so the
-        # fold still produces a usable checkpoint.
+  
         val_auc = val_stats['auc_roc']
         val_auc_is_valid = np.isfinite(val_auc)
         annealing_coeff = (
@@ -819,11 +784,11 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
 
 
 def do_edl_training(args, device):
-    """Main EDL training function with k-fold cross-validation."""
+
     
     args.n_class = 1
     
-    # Data setup
+   
     args.data_dir = Path(args.data_dir)
     args.df = pd.read_csv(args.data_dir / args.csv_file)
     args.df = args.df.fillna(0)
@@ -840,13 +805,13 @@ def do_edl_training(args, device):
     if args.data_frac < 1.0:
         dev_df = dev_df.sample(frac=args.data_frac, random_state=1, ignore_index=True)
     
-    # Output setup
+  
     now = datetime.now().strftime('%Y-%m-%d')
     args.output_path = Path(f"{args.output_dir}/EDL/{args.dataset}_{args.label}/fold_{args.n_folds}/{now}")
     os.makedirs(args.output_path, exist_ok=True)
     print(f"Output path: {args.output_path}")
     
-    # Save config
+ 
     args_dict = {
         k: str(v) if isinstance(v, Path) else v
         for k, v in args.__dict__.items()
@@ -879,10 +844,10 @@ def do_edl_training(args, device):
         )
         total_folds = args.n_folds
 
-    # Track fold results
+  
     all_val_results = []
     
-    # Store fold info for each validation sample
+ 
     fold_assignments = []
     
     for fold, (train_df, val_df) in enumerate(split_iter):
@@ -905,7 +870,7 @@ def do_edl_training(args, device):
         train_loader = MIL_dataloader(train_df, 'train', args)
         valid_loader = MIL_dataloader(val_df, valid_split_name, args)
         
-        # Build EDL model (MIL + EDL head)
+       
         pretrained_checkpoint = resolve_mil_checkpoint(args.resume, fold)
         if args.resume is not None and pretrained_checkpoint is None:
             print(f"[EDL] Warning: no checkpoint found under {args.resume} for fold {fold}; training from scratch.")
@@ -915,12 +880,12 @@ def do_edl_training(args, device):
             print("[EDL] Freeze mode enabled: training only EDL head(s); MIL backbone is frozen.")
         model.to(device)
         
-        # Print model info
+        
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
         
-        # Optimizer (full fine-tuning by default, or only EDL heads with --train_edl_only)
+
         trainable_parameters = [p for p in model.parameters() if p.requires_grad]
         if not trainable_parameters:
             raise RuntimeError("No trainable parameters found. Check the EDL freeze configuration.")
@@ -930,7 +895,7 @@ def do_edl_training(args, device):
             weight_decay=args.weight_decay
         )
         
-        # Scheduler
+     
         total_steps = len(train_loader) * args.epochs
         warmup_steps = len(train_loader) if args.warmup_epochs == 1 else 10
         warmup_steps = 0 if total_steps <= 1 else min(warmup_steps, total_steps - 1)
@@ -940,18 +905,17 @@ def do_edl_training(args, device):
             warmup_steps=warmup_steps
         )
         
-        # Scaler
+     
         scaler = torch.cuda.amp.GradScaler(enabled=args.apex and device.type == 'cuda')
         
-        # EDL Loss. Match the original weighted-BCE behavior by up-weighting
-        # positive samples in the EDL cross-entropy term.
+     
         class_weights = None
         if getattr(args, 'weighted_BCE', 'n') == 'y':
             class_weights = get_edl_class_weights(train_df, args.label)
 
         criterion = build_edl_criterion(args, class_weights=class_weights)
         
-        # Train
+     
         val_stats, best_checkpoint_path = edl_train_loop(
             train_loader, valid_loader, model, optimizer, scheduler, scaler,
             criterion, path_results_fold, args, device, valid_split_name=valid_split_name
@@ -970,13 +934,13 @@ def do_edl_training(args, device):
                 fold_summary[key] = val_stats[key]
         all_val_results.append(fold_summary)
         
-        # Load best model and generate predictions for all splits
+ 
         print(f"\nGenerating predictions with best model for fold {fold}...")
         checkpoint = torch.load(best_checkpoint_path, map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'])
         model.eval()
         
-        # Generate predictions for all data (train + val + test)
+        
         all_split_dfs = []
         split_specs = [('train', train_df), ('val', val_df), ('test', test_df)]
         for split_name, split_df in split_specs:
@@ -1014,12 +978,12 @@ def do_edl_training(args, device):
             keep_cols = [c for c in keep_cols if c in pred_df.columns]
             all_split_dfs.append(pred_df[keep_cols])
             
-            # Record fold assignment for val samples
+          
             if split_name == 'val':
                 for _, row in pred_df.iterrows():
                     fold_assignments.append(row.to_dict())
         
-        # Save fold predictions
+       
         if all_split_dfs:
             fold_pred_df = pd.concat(all_split_dfs, ignore_index=True)
             fold_pred_df.to_csv(path_results_fold / f'{args.dataset}_edl_predictions_fold_{fold}.csv', index=False)
@@ -1028,7 +992,7 @@ def do_edl_training(args, device):
         del model
         clear_memory()
     
-    # Save summary results
+    
     summary_df = pd.DataFrame(all_val_results)
     if len(summary_df) > 1:
         metric_cols = [col for col in summary_df.columns if col not in ['fold', 'eval_source']]
@@ -1041,7 +1005,7 @@ def do_edl_training(args, device):
     print(f"\nResults summary saved to {args.output_path / 'edl_results_summary.csv'}")
     print(summary_df.to_string())
     
-    # Save fold assignments
+ 
     if fold_assignments:
         fold_df = pd.DataFrame(fold_assignments)
         fold_df.to_csv(args.output_path / f'{args.dataset}_edl_val_fold_assignments.csv', index=False)
@@ -1053,7 +1017,7 @@ def do_edl_training(args, device):
 def main():
     args = config()
     
-    # Setup
+  
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     print(f"[INFO] Using GPU {args.gpu_id}")
     
@@ -1062,16 +1026,15 @@ def main():
     print(f'Using device: {device}')
     
     args.apex = True if args.apex == "y" else False
-    
-    # Clean up
+  
     if hasattr(args, 'df'):
         del args.df
     torch.cuda.empty_cache()
     
-    # ===== Training =====
+
     output_path = do_edl_training(args, device)
     
-    # ===== Auto Test =====
+
     print("\n" + "=" * 60)
     print("  Training complete. Starting automatic EDL testing...")
     print("=" * 60)
