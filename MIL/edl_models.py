@@ -1,9 +1,4 @@
-"""
-Evidential Deep Learning (EDL) module for MIL models.
 
-Wraps a pretrained MIL model and replaces the classification head with an EDL head
-that outputs Dirichlet distribution parameters for uncertainty estimation.
-"""
 
 import torch
 import torch.nn as nn
@@ -13,17 +8,11 @@ import numpy as np
 
 class EDLHead(nn.Module):
     """
-    Evidential Deep Learning classification head.
-    
-    Replaces the standard linear classification head. Outputs evidence values
-    which are used to construct Dirichlet distribution parameters.
-    
-    For binary classification (K=2):
-        - evidence = Softplus(Linear(x))   shape: (B, K)
-        - alpha = evidence + 1              Dirichlet parameters
-        - S = sum(alpha)                    Dirichlet strength
-        - p_k = alpha_k / S                predicted probability
-        - uncertainty = K / S               aleatoric + epistemic uncertainty
+        evidence = Softplus(Linear(x))   shape: (B, K)
+        alpha = evidence + 1              
+        S = sum(alpha)                    
+        p_k = alpha_k / S              
+        uncertainty = K / S               
     """
     def __init__(self, in_features, num_classes=2, dropout=0.0):
         super(EDLHead, self).__init__()
@@ -32,18 +21,7 @@ class EDLHead(nn.Module):
         self.softplus = nn.Softplus()
     
     def forward(self, x):
-        """
-        Args:
-            x: Input features of shape (B, in_features)
-        
-        Returns:
-            dict with:
-                evidence: (B, K) raw evidence values
-                alpha: (B, K) Dirichlet parameters (evidence + 1)
-                S: (B,) Dirichlet strength (sum of alpha)
-                prob: (B, K) predicted probabilities
-                uncertainty: (B,) total uncertainty
-        """
+
         x = self.drop(x)
         evidence = self.softplus(self.linear(x))  # (B, K), ensure evidence >= 0
         alpha = evidence + 1.0
@@ -61,26 +39,14 @@ class EDLHead(nn.Module):
 
 
 class MIL_EDL_Wrapper(nn.Module):
-    """
-    Wrapper that takes a pretrained MIL model and replaces its classification head(s)
-    with EDL heads for evidential uncertainty estimation.
-    
-    Supports:
-        - EmbeddingMIL (single-scale)
-        - PyramidalMILmodel (multi-scale with concatenation/gated-attention)
-    
-    During forward, the wrapper:
-        1. Passes input through MIL encoder + aggregator to get bag-level features
-        2. Passes bag features through EDL head(s)
-        3. Returns EDL outputs (evidence, alpha, prob, uncertainty)
-    """
+
     def __init__(self, mil_model, edl_dropout=0.0):
         super(MIL_EDL_Wrapper, self).__init__()
         
         self.mil_model = mil_model
         self.is_training = True
         
-        # Determine the MIL model type and create appropriate EDL head(s)
+
         self.mil_type = getattr(mil_model, 'mil_type', 'embedding')
         self.multi_scale_model = mil_model.multi_scale_model
         self.scales = getattr(mil_model, 'scales', None)
@@ -88,14 +54,13 @@ class MIL_EDL_Wrapper(nn.Module):
         self.deep_supervision = getattr(mil_model, 'deep_supervision', False)
         self.pooling_type = mil_model.pooling_type
         
-        # Replace the main classifier with EDL head
+  
         if hasattr(mil_model, 'classifier'):
             in_features = self._get_classifier_in_features(mil_model.classifier)
             num_classes = mil_model.num_classes
-            # For binary classification in EDL, we use K=2
+     
             self.edl_head = EDLHead(in_features, num_classes=2, dropout=edl_dropout)
-        
-        # Replace side classifiers (for deep supervision) with EDL heads
+      
         self.edl_side_heads = nn.ModuleDict()
         if hasattr(mil_model, 'side_classifiers'):
             for key, clf in mil_model.side_classifiers.items():
@@ -103,7 +68,7 @@ class MIL_EDL_Wrapper(nn.Module):
                 self.edl_side_heads[key] = EDLHead(in_feat, num_classes=2, dropout=edl_dropout)
     
     def _get_classifier_in_features(self, classifier_module):
-        """Extract the input feature dimension from a classifier head."""
+  
         if isinstance(classifier_module.head_classifier, nn.Sequential):
             linear = classifier_module.head_classifier[0]
         else:
@@ -111,13 +76,10 @@ class MIL_EDL_Wrapper(nn.Module):
         return linear.in_features
     
     def _run_encoder_aggregator(self, x, bag_mask=None):
-        """
-        Run the MIL encoder and aggregator to extract bag-level features.
-        Returns the bag feature tensor (before classification).
-        """
+
         model = self.mil_model
         
-        # Instance-level feature extraction
+  
         if model.inst_encoder is not None:
             if isinstance(x, list):
                 batch_size, num_patches, _, _, _ = x[0].size()
@@ -154,17 +116,12 @@ class MIL_EDL_Wrapper(nn.Module):
         return x
     
     def forward(self, x, bag_mask=None):
-        """
-        Forward pass through MIL encoder/aggregator + EDL head.
-        
-        Returns:
-            dict with EDL outputs and optional side outputs
-        """
+
         model = self.mil_model
         
-        # ---- Single-scale EmbeddingMIL ----
+   
         if self.mil_type == 'embedding' and not self.multi_scale_model:
-            # Instance encoder
+        
             if model.inst_encoder is not None:
                 batch_size, num_patches, C, H, W = x.size()
                 x_feat = x.view(-1, C, H, W)
@@ -172,37 +129,34 @@ class MIL_EDL_Wrapper(nn.Module):
                 x_feat = x_feat.view(batch_size, num_patches, -1)
             else:
                 x_feat = x
-            
-            # MIL encoder
+        
             from MIL.AttentionModels import SetAttentionBlock, InducedSetAttentionBlock
             for block_encoder in model.encoder:
                 if isinstance(block_encoder, (SetAttentionBlock, InducedSetAttentionBlock)):
                     x_feat = block_encoder(x_feat, bag_mask)
                 else:
                     x_feat = block_encoder(x_feat)
-            
-            # MIL aggregator
+      
             if self.pooling_type in ["attention", "gated-attention", "pma"]:
                 bag_feat, A = model.aggregator(x_feat, bag_mask)
             else:
                 bag_feat = model.aggregator(x_feat, bag_mask)
-            
-            # EDL head
+         
             edl_out = self.edl_head(bag_feat)
             edl_out['type'] = 'single_scale'
             return edl_out
         
-        # ---- Multi-scale PyramidalMIL ----
+  
         else:
             return self._forward_pyramidal(x, bag_mask)
     
     def _forward_pyramidal(self, x, bag_mask=None):
-        """Forward for multi-scale pyramidal MIL models."""
+     
         from collections import OrderedDict
         from MIL.AttentionModels import SetAttentionBlock, InducedSetAttentionBlock
         model = self.mil_model
         
-        # Feature extraction
+      
         x_pyramid = None
         if model.inst_encoder is not None:
             if isinstance(x, list):
@@ -233,14 +187,14 @@ class MIL_EDL_Wrapper(nn.Module):
         for scale in self.scales:
             x_patches = x_pyramid[f'feat_{self.scales.index(scale)}']
             
-            # Scale-specific encoder
+       
             for block_encoder in model.side_inst_aggregator['encoders'][f'encoder_{scale}']:
                 if isinstance(block_encoder, (SetAttentionBlock, InducedSetAttentionBlock)):
                     x_patches = block_encoder(x_patches, bag_mask)
                 else:
                     x_patches = block_encoder(x_patches)
             
-            # Scale-specific aggregator
+            
             if self.pooling_type in ["attention", "gated-attention", "pma"]:
                 x_patches, A = model.side_inst_aggregator['aggregators'][f'aggregator_{scale}'](x_patches, bag_mask)
             else:
@@ -248,12 +202,11 @@ class MIL_EDL_Wrapper(nn.Module):
             
             scale_outputs.append(x_patches)
             
-            # Side EDL heads (deep supervision)
+     
             if f'classifier_{scale}' in self.edl_side_heads:
                 side_edl_out = self.edl_side_heads[f'classifier_{scale}'](x_patches)
                 side_edl_outputs[scale] = side_edl_out
         
-        # Scale aggregation
         if self.type_scale_aggregator in ['mean_p', 'max_p']:
             if not side_edl_outputs:
                 raise RuntimeError(
@@ -293,7 +246,7 @@ class MIL_EDL_Wrapper(nn.Module):
         else:
             raise ValueError(f"Unsupported scale aggregator for EDL: {self.type_scale_aggregator}")
         
-        # Main EDL head
+
         edl_out = self.edl_head(x_agg)
         edl_out['type'] = 'multi_scale'
         edl_out['side_outputs'] = side_edl_outputs

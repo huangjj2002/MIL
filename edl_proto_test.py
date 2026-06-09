@@ -1,9 +1,4 @@
-"""
-Prototype + EDL inference script.
 
-Loads Prototype+EDL fold checkpoints, predicts validation and held-out test
-splits, and writes CSVs aligned with the existing MIL/EDL outputs.
-"""
 
 import argparse
 import os
@@ -35,7 +30,6 @@ from utils.metrics import auroc, evaluate_metrics
 
 
 def config():
-    """Parse base EDL test arguments plus Prototype+EDL-only arguments."""
     proto_parser = argparse.ArgumentParser(add_help=False)
     _add_proto_args(proto_parser)
     proto_args, remaining = proto_parser.parse_known_args()
@@ -106,9 +100,6 @@ def _build_ensemble(test_all_df, args):
 
 
 def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
-    """
-    Prototype+EDL test function that can be called from training or standalone.
-    """
     if checkpoint_dir is not None:
         checkpoint_dir = Path(checkpoint_dir)
     elif hasattr(args, "checkpoint_dir"):

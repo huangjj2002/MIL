@@ -1,9 +1,4 @@
-"""
-Prototype + EDL training script.
 
-This is a separate third path for comparing MIL, EDL, and Prototype+EDL. The
-existing EDL scripts are intentionally left unchanged.
-"""
 
 import argparse
 import gc
@@ -77,7 +72,7 @@ def _add_proto_args(parser):
 
 
 def config():
-    """Parse base EDL arguments plus Prototype+EDL-only arguments."""
+
     proto_parser = argparse.ArgumentParser(add_help=False)
     _add_proto_args(proto_parser)
     proto_args, remaining = proto_parser.parse_known_args()
@@ -110,12 +105,7 @@ def _looks_like_edl_proto_state_dict(state_dict):
 
 
 def build_edl_proto_model(args, checkpoint_path=None):
-    """
-    Build MIL backbone, load optional checkpoint, and wrap with Prototype+EDL.
 
-    Returns:
-        model, loaded_proto_checkpoint
-    """
     args.n_class = 1
     if args.feature_extraction == "online" and not getattr(args, "clip_chk_pt_path", None):
         raise ValueError(
@@ -234,7 +224,6 @@ def _single_output_proto_reg(edl_out, labels, margin, balance_classes=True):
 
 
 def _prototype_diversity_loss(model, margin):
-    """Penalize same-class prototype collapse for all prototype heads."""
     heads = model.prototype_heads() if hasattr(model, "prototype_heads") else {}
     losses = []
 
@@ -267,7 +256,6 @@ def _prototype_diversity_loss(model, margin):
 
 
 def prototype_regularization_loss(model, edl_out, labels, args):
-    """Combined prototype regularization for main and side Prototype+EDL heads."""
     margin = float(getattr(args, "edl_proto_margin", 1.0))
     attract_weight = float(getattr(args, "edl_proto_attract_weight", 0.0))
     separation_weight = float(getattr(args, "edl_proto_separation_weight", 0.0))
@@ -322,13 +310,13 @@ def prototype_regularization_loss(model, edl_out, labels, args):
 
 
 def keep_frozen_mil_backbone_in_eval(model, args):
-    """Keep frozen backbone modules deterministic while prototype heads train."""
+
     if getattr(args, "train_edl_only", False):
         model.mil_model.eval()
 
 
 def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device):
-    """Training loop for one epoch with EDL loss plus prototype regularization."""
+
     model.train()
     keep_frozen_mil_backbone_in_eval(model, args)
     model.is_training = True
@@ -434,7 +422,7 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
 
 def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
                          criterion, output_path, args, device, valid_split_name="val"):
-    """Full Prototype+EDL training loop across epochs."""
+
     best_aucroc = -float("inf")
     best_val_loss = float("inf")
     best_epoch = 0
@@ -555,7 +543,6 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
 
 @torch.no_grad()
 def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
-    """Initialize every PrototypeEDLHead from current-fold training embeddings."""
     if args.edl_proto_init != "kmeans":
         print("[EDL_PROTO] Prototype KMeans initialization skipped; using random init.")
         return
@@ -651,7 +638,6 @@ def _append_proto_batch(proto_buffers, edl_out):
 
 @torch.no_grad()
 def edl_proto_predict(loader, model, args, device, desc="EDL_PROTO predict"):
-    """Run Prototype+EDL inference and return sample-level predictions."""
     model.eval()
     model.is_training = False
 
@@ -768,7 +754,6 @@ def build_prediction_df(split_df, sample_results, split_name, fold, args):
 
 
 def do_edl_proto_training(args, device):
-    """Main Prototype+EDL training function with k-fold cross-validation."""
     args.n_class = 1
     args.data_dir = Path(args.data_dir)
     args.df = pd.read_csv(args.data_dir / args.csv_file).fillna(0)

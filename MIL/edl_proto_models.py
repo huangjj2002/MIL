@@ -1,10 +1,4 @@
-"""
-Prototype + Evidential Deep Learning modules for MIL models.
 
-This module is intentionally separate from MIL.edl_models so the existing EDL
-baseline remains unchanged. It keeps the same EDL output contract while adding
-prototype-level evidence and top-k explanation fields.
-"""
 
 import math
 
@@ -25,12 +19,7 @@ def _inverse_softplus(value):
 
 
 class PrototypeEDLHead(nn.Module):
-    """
-    Class-wise prototype head that directly produces EDL evidence.
-
-    For binary tasks the prototype tensor has shape (2, K, D), where class 0 is
-    the negative class and class 1 is the positive class for args.label.
-    """
+ 
 
     def __init__(
         self,
@@ -122,17 +111,7 @@ class PrototypeEDLHead(nn.Module):
         return out
 
     def initialize_from_embeddings(self, embeddings, labels, random_state=0):
-        """
-        Initialize prototypes with per-class KMeans centers.
 
-        Args:
-            embeddings: array-like of shape (N, D)
-            labels: array-like of shape (N,), containing 0/1 class labels
-            random_state: deterministic seed for KMeans
-
-        Returns:
-            list of warning strings generated during fallback initialization.
-        """
         if isinstance(embeddings, torch.Tensor):
             embeddings = embeddings.detach().cpu().float().numpy()
         else:
@@ -200,13 +179,7 @@ class PrototypeEDLHead(nn.Module):
 
 
 class MIL_EDL_Prototype_Wrapper(MIL_EDL_Wrapper):
-    """
-    MIL wrapper with PrototypeEDLHead modules.
 
-    The parent wrapper already mirrors the MIL encoder and aggregation paths.
-    This subclass only swaps the EDL heads, keeping the existing baseline module
-    untouched.
-    """
 
     def __init__(
         self,
