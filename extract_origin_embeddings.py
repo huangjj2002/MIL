@@ -39,14 +39,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Data and output paths
-    parser.add_argument("--data-dir", default="datasets/Vindir-mammoclip", type=str)
+    parser.add_argument("--data-dir", "--data_dir", dest="data_dir", default="datasets/Vindir-mammoclip", type=str)
     parser.add_argument(
         "--img-dir",
+        "--img_dir",
+        dest="img_dir",
         default="VinDir_preprocessed_mammoclip/images_png",
         type=str,
         help="Image directory relative to data-dir.",
     )
-    parser.add_argument("--csv-file", default="grouped_df.csv", type=str)
+    parser.add_argument("--csv-file", "--csv_file", dest="csv_file", default="grouped_df.csv", type=str)
     parser.add_argument("--clip_chk_pt_path", required=True, type=str)
     parser.add_argument("--out-dir", default="origin_encoder_embeddings", type=str)
     parser.add_argument(
@@ -154,6 +156,8 @@ def parse_args() -> argparse.Namespace:
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.data_dir = Path(args.data_dir)
     args.out_dir = Path(args.out_dir)
+    args.img_dir = Path(args.img_dir)
+    args.csv_file = Path(args.csv_file)
     args.clip_chk_pt_path = str(Path(args.clip_chk_pt_path))
     if args.origin_checkpoint is not None:
         args.origin_checkpoint = str(Path(args.origin_checkpoint))
@@ -400,6 +404,7 @@ def load_and_split_dataframe(args: argparse.Namespace):
     from utils.data_split_utils import adaptive_stratified_train_val_split, split_df_by_cohorts
 
     csv_path = args.data_dir / args.csv_file
+    print(f"[INFO] Loading CSV: {csv_path}")
     df = pd.read_csv(csv_path).fillna(0)
     if args.label not in df.columns:
         raise ValueError(f"Label column '{args.label}' was not found in {csv_path}.")
@@ -580,7 +585,13 @@ def export_embeddings(args: argparse.Namespace):
     from tqdm import tqdm
 
     device = get_device(args)
+    if args.gpu_id is not None:
+        print(f"[INFO] Requested GPU id: {args.gpu_id}")
+        print(f"[INFO] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
     print(f"[INFO] Using device: {device}")
+    if device.type == "cuda":
+        print(f"[INFO] torch.cuda.current_device(): {torch.cuda.current_device()}")
+    print(f"[INFO] Image root: {args.data_dir / args.img_dir}")
 
     split_dfs = load_and_split_dataframe(args)
     prepare_output_dir(args.out_dir, args.overwrite)
