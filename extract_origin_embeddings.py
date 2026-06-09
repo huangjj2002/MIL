@@ -49,6 +49,22 @@ def parse_args() -> argparse.Namespace:
         help="Image directory relative to data-dir.",
     )
     parser.add_argument("--csv-file", "--csv_file", dest="csv_file", default="grouped_df.csv", type=str)
+    parser.add_argument(
+        "--csv-path",
+        "--csv_path",
+        dest="csv_path",
+        default=None,
+        type=str,
+        help="Optional direct CSV path. Overrides data-dir/csv-file when provided.",
+    )
+    parser.add_argument(
+        "--img-root",
+        "--img_root",
+        dest="img_root",
+        default=None,
+        type=str,
+        help="Optional direct image root. Overrides data-dir/img-dir when provided.",
+    )
     parser.add_argument("--clip_chk_pt_path", required=True, type=str)
     parser.add_argument("--out-dir", default="origin_encoder_embeddings", type=str)
     parser.add_argument(
@@ -158,6 +174,8 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.out_dir = Path(args.out_dir)
     args.img_dir = Path(args.img_dir)
     args.csv_file = Path(args.csv_file)
+    args.csv_path = Path(args.csv_path) if args.csv_path is not None else None
+    args.img_root = Path(args.img_root) if args.img_root is not None else None
     args.clip_chk_pt_path = str(Path(args.clip_chk_pt_path))
     if args.origin_checkpoint is not None:
         args.origin_checkpoint = str(Path(args.origin_checkpoint))
@@ -349,7 +367,7 @@ class FixedPatchBagDataset:
 
         self.args = args
         self.df = df.reset_index(drop=True)
-        self.img_root = args.data_dir / args.img_dir
+        self.img_root = args.img_root if args.img_root is not None else args.data_dir / args.img_dir
         self.to_tensor = transforms.ToTensor()
         self.normalize = transforms.Normalize(mean=args.mean, std=args.std)
         self.use_rgb = args.arch.lower() in RGB_ARCHES
@@ -403,7 +421,7 @@ def load_and_split_dataframe(args: argparse.Namespace):
 
     from utils.data_split_utils import adaptive_stratified_train_val_split, split_df_by_cohorts
 
-    csv_path = args.data_dir / args.csv_file
+    csv_path = args.csv_path if args.csv_path is not None else args.data_dir / args.csv_file
     print(f"[INFO] Loading CSV: {csv_path}")
     df = pd.read_csv(csv_path).fillna(0)
     if args.label not in df.columns:
@@ -591,7 +609,8 @@ def export_embeddings(args: argparse.Namespace):
     print(f"[INFO] Using device: {device}")
     if device.type == "cuda":
         print(f"[INFO] torch.cuda.current_device(): {torch.cuda.current_device()}")
-    print(f"[INFO] Image root: {args.data_dir / args.img_dir}")
+    image_root = args.img_root if args.img_root is not None else args.data_dir / args.img_dir
+    print(f"[INFO] Image root: {image_root}")
 
     split_dfs = load_and_split_dataframe(args)
     prepare_output_dir(args.out_dir, args.overwrite)
