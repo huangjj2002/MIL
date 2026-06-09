@@ -24,8 +24,8 @@ from torch.optim.lr_scheduler import LambdaLR
 # Internal imports
 from Datasets.dataset_utils import MIL_dataloader
 from MIL import build_model
-from MIL.edl_models import EDLHead, MIL_EDL_Wrapper
-from MIL.edl_losses import EDLCombinedLoss, edl_crossentropy_loss, kl_divergence_dirichlet
+from MIL.edl_models import BagEmbeddingDSTModel, MIL_EDL_Wrapper
+from MIL.edl_losses import DSTNLLLoss
 from utils.metrics import auroc, evaluate_metrics
 from utils.generic_utils import seed_all, AverageMeter, clear_memory
 from utils.data_split_utils import (
@@ -36,31 +36,44 @@ from utils.data_split_utils import (
 
 
 def config():
-    parser = argparse.ArgumentParser(description="EDL Training Script")
+    parser = argparse.ArgumentParser(description="DST Training Script")
     
-    # ===== EDL-specific arguments =====
-    parser.add_argument('--edl_kl_weight', type=float, default=0.1, help='Weight for KL divergence regularization')
-    parser.add_argument('--edl_annealing_epochs', type=int, default=10, help='Number of epochs for KL annealing')
-    parser.add_argument('--edl_annealing_start', type=int, default=0, help='Epoch to start KL annealing')
-    parser.add_argument('--edl_dropout', type=float, default=0.0, help='Dropout for EDL head')
+    # ===== DST-specific arguments =====
+    parser.add_argument('--edl_kl_weight', type=float, default=0.1, help='Legacy EDL argument ignored by DST loss.')
+    parser.add_argument('--edl_annealing_epochs', type=int, default=10, help='Legacy EDL argument ignored by DST loss.')
+    parser.add_argument('--edl_annealing_start', type=int, default=0, help='Legacy EDL argument ignored by DST loss.')
+    parser.add_argument('--edl_dropout', type=float, default=0.0, help='Dropout for DST head')
+    parser.add_argument('--dst_k', '--dst-k', dest='dst_k', default=4, type=int,
+                        help='Number of DST prototypes per class for the vanilla DST head.')
+    parser.add_argument('--dst_topk', '--dst-topk', dest='dst_topk', default=0, type=int,
+                        help='Number of top DST prototypes to keep in the vanilla head output.')
+    parser.add_argument('--dst_gamma_init', '--dst-gamma-init', dest='dst_gamma_init',
+                        default=1.0, type=float,
+                        help='Initial DST distance sharpness.')
+    parser.add_argument('--dst_alpha_init', '--dst-alpha-init', dest='dst_alpha_init',
+                        default=0.0, type=float,
+                        help='Initial DST prototype reliability logit.')
+    parser.add_argument('--dst_normalize', '--dst-normalize', dest='dst_normalize',
+                        default='y', choices=['y', 'n'],
+                        help='Normalize bag vectors and prototypes before DST distance computation.')
     parser.add_argument('--edl_focal_gamma', '--edl-focal-gamma', dest='edl_focal_gamma',
                         type=float, default=0.0,
-                        help='Optional focal modulation for the EDL data loss. 0 preserves legacy behavior.')
+                        help='Legacy EDL argument ignored by DST loss.')
     parser.add_argument('--edl_wrong_evidence_penalty_weight', '--edl-wrong-evidence-penalty-weight',
                         dest='edl_wrong_evidence_penalty_weight', type=float, default=0.0,
-                        help='Weight for wrong-direction high-evidence penalty. 0 disables it.')
+                        help='Legacy EDL argument ignored by DST loss.')
     parser.add_argument('--edl_wrong_evidence_margin', '--edl-wrong-evidence-margin',
                         dest='edl_wrong_evidence_margin', type=float, default=0.05,
-                        help='Probability margin for wrong-evidence penalty.')
+                        help='Legacy EDL argument ignored by DST loss.')
     parser.add_argument('--edl_wrong_evidence_class_balanced', '--edl-wrong-evidence-class-balanced',
                         dest='edl_wrong_evidence_class_balanced', default='y', choices=['y', 'n'],
-                        help='Average wrong-evidence penalty by class before reducing.')
+                        help='Legacy EDL argument ignored by DST loss.')
     parser.add_argument('--edl_loss_weight_normalization', '--edl-loss-weight-normalization',
                         dest='edl_loss_weight_normalization', default='legacy_mean',
                         choices=['legacy_mean', 'weighted_mean'],
-                        help='legacy_mean preserves current MIL weighted CE; weighted_mean matches Mammo-CLIP style.')
+                        help='Legacy EDL argument ignored by DST loss.')
     parser.add_argument('--train_edl_only', '--freeze_backbone', action='store_true', default=False,
-                        help='Freeze the MIL backbone and train only EDL head(s)')
+                        help='Freeze the MIL backbone and train only DST head(s)')
     
     # ===== Folder arguments =====
     parser.add_argument("--gpu_id", type=str, default="0")
@@ -70,6 +83,9 @@ def config():
                         help="Path to Mammo-CLIP checkpoint; required when --feature_extraction online")
     parser.add_argument("--csv_file", default="grouped_df.csv", type=str)
     parser.add_argument('--feat_dir', default='new_extracted_features', type=str)
+    parser.add_argument('--embedding_cache_dir', '--embedding-cache-dir',
+                        dest='embedding_cache_dir', default=None, type=str,
+                        help='Path to extract_origin_embeddings.py bag_origin cache.')
     parser.add_argument("--img_dir", default="VinDir_preprocessed_mammoclip/images_png", type=str)
     parser.add_argument('--train', action='store_true', default=True)
     
@@ -226,12 +242,25 @@ def _get_checkpoint_state_dict(checkpoint):
     return checkpoint
 
 
+def _infer_bag_embedding_dim(args):
+    if getattr(args, 'embedding_cache_dir', None) is None:
+        raise ValueError("--embedding_cache_dir is required when --feature_extraction bag_embedding.")
+    embeddings_path = Path(args.embedding_cache_dir) / "embeddings.npy"
+    if not embeddings_path.exists():
+        raise FileNotFoundError(f"Bag embeddings not found: {embeddings_path}")
+    embeddings = np.load(embeddings_path, mmap_mode='r')
+    if embeddings.ndim != 2:
+        raise ValueError(f"Expected embeddings.npy to be 2D, got shape {embeddings.shape}.")
+    return int(embeddings.shape[1])
+
+
 def _looks_like_edl_state_dict(state_dict):
 
     if not isinstance(state_dict, dict):
         return False
     return any(
-        key.startswith(('mil_model.', 'edl_head.', 'edl_side_heads.'))
+        key.startswith(('mil_model.', 'edl_head.', 'edl_side_heads.', 'dst_head.'))
+        or 'ds_module' in key
         for key in state_dict.keys()
     )
 
@@ -270,8 +299,6 @@ def build_edl_model(args, checkpoint_path=None):
             "so the Mammo-CLIP image encoder/backbone can be initialized."
         )
 
-    mil_model = build_model(args)
-
     checkpoint_state = None
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
@@ -279,32 +306,64 @@ def build_edl_model(args, checkpoint_path=None):
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             checkpoint_state = _get_checkpoint_state_dict(checkpoint)
         else:
-            print(f"[EDL] Warning: checkpoint not found at {checkpoint_path}, training from scratch.")
+            print(f"[DST] Warning: checkpoint not found at {checkpoint_path}, training from scratch.")
 
-    is_edl_checkpoint = _looks_like_edl_state_dict(checkpoint_state)
-    if checkpoint_state is not None and not is_edl_checkpoint:
+    is_dst_checkpoint = _looks_like_edl_state_dict(checkpoint_state)
+    if args.feature_extraction == 'bag_embedding':
+        model = BagEmbeddingDSTModel(
+            in_features=_infer_bag_embedding_dim(args),
+            edl_dropout=args.edl_dropout,
+            dst_k=args.dst_k,
+            dst_topk=args.dst_topk,
+            dst_normalize=args.dst_normalize,
+            dst_gamma_init=args.dst_gamma_init,
+            dst_alpha_init=args.dst_alpha_init,
+        )
+        if checkpoint_state is not None:
+            load_msg = model.load_state_dict(checkpoint_state, strict=False)
+            print(f"[DST] Loaded DST checkpoint from: {checkpoint_path}")
+            _print_load_summary("[DST][load]", load_msg)
+        return model
+
+    mil_model = build_model(args)
+
+    if checkpoint_state is not None and not is_dst_checkpoint:
         load_msg = mil_model.load_state_dict(checkpoint_state, strict=False)
-        print(f"[EDL] Loaded pretrained MIL backbone from: {checkpoint_path}")
-        _print_load_summary("[EDL][MIL load]", load_msg)
+        print(f"[DST] Loaded pretrained MIL backbone from: {checkpoint_path}")
+        _print_load_summary("[DST][MIL load]", load_msg)
 
-    edl_model = MIL_EDL_Wrapper(mil_model, edl_dropout=args.edl_dropout)
-    if checkpoint_state is not None and is_edl_checkpoint:
+    dst_model = MIL_EDL_Wrapper(
+        mil_model,
+        edl_dropout=args.edl_dropout,
+        dst_k=args.dst_k,
+        dst_topk=args.dst_topk,
+        dst_normalize=args.dst_normalize,
+        dst_gamma_init=args.dst_gamma_init,
+        dst_alpha_init=args.dst_alpha_init,
+    )
+    if checkpoint_state is not None and is_dst_checkpoint:
 
-        load_msg = edl_model.load_state_dict(checkpoint_state, strict=False)
-        print(f"[EDL] Loaded EDL training checkpoint from: {checkpoint_path}")
-        _print_load_summary("[EDL][EDL load]", load_msg)
+        load_msg = dst_model.load_state_dict(checkpoint_state, strict=False)
+        print(f"[DST] Loaded DST training checkpoint from: {checkpoint_path}")
+        _print_load_summary("[DST][DST load]", load_msg)
 
-    return edl_model
+    return dst_model
 
 
 def freeze_mil_backbone_train_edl_only(model):
 
-    for param in model.mil_model.parameters():
-        param.requires_grad = False
+    if hasattr(model, 'mil_model'):
+        for param in model.mil_model.parameters():
+            param.requires_grad = False
 
     edl_head = getattr(model, 'edl_head', None)
     if edl_head is not None:
         for param in edl_head.parameters():
+            param.requires_grad = True
+
+    dst_head = getattr(model, 'dst_head', None)
+    if dst_head is not None:
+        for param in dst_head.parameters():
             param.requires_grad = True
 
     edl_side_heads = getattr(model, 'edl_side_heads', None)
@@ -315,16 +374,14 @@ def freeze_mil_backbone_train_edl_only(model):
 
 def keep_frozen_mil_backbone_in_eval(model, args):
 
-    if getattr(args, 'train_edl_only', False):
+    if getattr(args, 'train_edl_only', False) and hasattr(model, 'mil_model'):
         model.mil_model.eval()
 
 
 EDL_LOSS_DIAGNOSTIC_KEYS = [
+    'nll_loss',
     'ce_loss',
     'data_loss',
-    'unweighted_ce_loss',
-    'class_weighted_ce_loss',
-    'focal_ce_loss',
     'kl_loss',
     'annealing',
     'wrong_evidence_penalty',
@@ -333,33 +390,19 @@ EDL_LOSS_DIAGNOSTIC_KEYS = [
     'focal_factor_mean',
     'sample_weight_mean',
     'focal_weighted_denominator',
+    'mass_0_mean',
+    'mass_1_mean',
+    'mass_omega_mean',
     'total_loss',
-    'class0_ce_loss_mean',
-    'class0_weighted_ce_loss_mean',
-    'class0_focal_weighted_ce_loss_mean',
-    'class0_focal_factor_mean',
-    'class0_wrong_evidence_penalty_mean',
-    'class1_ce_loss_mean',
-    'class1_weighted_ce_loss_mean',
-    'class1_focal_weighted_ce_loss_mean',
-    'class1_focal_factor_mean',
-    'class1_wrong_evidence_penalty_mean',
+    'class0_nll_loss_mean',
+    'class0_mass_mean',
+    'class1_nll_loss_mean',
+    'class1_mass_mean',
 ]
 
 
 def build_edl_criterion(args, class_weights=None):
-    return EDLCombinedLoss(
-        num_classes=2,
-        kl_weight=args.edl_kl_weight,
-        annealing_start=args.edl_annealing_start,
-        annealing_epochs=args.edl_annealing_epochs,
-        class_weights=class_weights,
-        focal_gamma=getattr(args, 'edl_focal_gamma', 0.0),
-        wrong_evidence_penalty_weight=getattr(args, 'edl_wrong_evidence_penalty_weight', 0.0),
-        wrong_evidence_margin=getattr(args, 'edl_wrong_evidence_margin', 0.05),
-        wrong_evidence_class_balanced=getattr(args, 'edl_wrong_evidence_class_balanced', 'y'),
-        loss_weight_normalization=getattr(args, 'edl_loss_weight_normalization', 'legacy_mean'),
-    )
+    return DSTNLLLoss(class_weights=class_weights)
 
 
 def _new_loss_meters():
@@ -421,7 +464,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     loss_meters = _new_loss_meters()
     
     progress_iter = tqdm(enumerate(train_loader),
-                         desc=f"[{epoch + 1:03d}/{args.epochs:03d} EDL train]",
+                         desc=f"[{epoch + 1:03d}/{args.epochs:03d} DST train]",
                          total=len(train_loader))
     
     targs = []
@@ -445,13 +488,9 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         with torch.cuda.amp.autocast(enabled=amp_enabled):
         
             edl_out = model(inputs)
-            
-            alpha = edl_out['alpha']  # (B, K)
-            
-        
-            loss, loss_dict = criterion(alpha, labels, epoch=epoch)
+            loss, loss_dict = criterion(edl_out, labels, epoch=epoch)
             for side_out in edl_out.get('side_outputs', {}).values():
-                side_loss, _ = criterion(side_out['alpha'], labels, epoch=epoch)
+                side_loss, _ = criterion(side_out, labels, epoch=epoch)
                 loss = loss + side_loss
         
         losses.update(loss.item(), batch_size)
@@ -488,7 +527,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
             "kl": f"{kl_losses.avg:.4f}",
             "wep": f"{loss_meters['wrong_evidence_penalty'].avg:.4f}",
             "viol": f"{loss_meters['margin_violation_mean'].avg:.4f}",
-            "evid": f"{loss_meters['total_evidence_mean'].avg:.4f}",
+            "omega": f"{loss_meters['mass_omega_mean'].avg:.4f}",
             "CUDA-Mem": f"{cuda_mem}%",
         })
     
@@ -529,15 +568,14 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
     probs_list = []
     preds_list = []
     uncertainty_list = []
-    evidence_list = []
-    alpha_list = []
+    mass_list = []
     
     sample_patient_ids = []
     sample_image_ids = []
     
     if split == 'val':
         progress_iter = tqdm(enumerate(valid_loader),
-                             desc=f"[{epoch + 1:03d}/{args.epochs:03d} EDL valid]",
+                             desc=f"[{epoch + 1:03d}/{args.epochs:03d} DST valid]",
                              total=len(valid_loader))
     else:
         progress_iter = tqdm(enumerate(valid_loader), total=len(valid_loader))
@@ -560,10 +598,9 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
         amp_enabled = args.apex and device.type == 'cuda'
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             edl_out = model(inputs)
-            alpha = edl_out['alpha']
-            loss, loss_dict = criterion_eval(alpha, labels, epoch=epoch)
+            loss, loss_dict = criterion_eval(edl_out, labels, epoch=epoch)
             for side_out in edl_out.get('side_outputs', {}).values():
-                side_loss, _ = criterion_eval(side_out['alpha'], labels, epoch=epoch)
+                side_loss, _ = criterion_eval(side_out, labels, epoch=epoch)
                 loss = loss + side_loss
         
         losses.update(loss.item(), batch_size)
@@ -572,14 +609,13 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
         prob = edl_out['prob'].detach()
         pred_class = torch.argmax(prob, dim=-1)
         uncertainty = edl_out['uncertainty'].detach()
-        evidence = edl_out['evidence'].detach()
+        mass = edl_out['dst_mass'].detach()
         
         targs.append(labels.cpu().numpy())
         probs_list.append(prob[:, 1].cpu().numpy())
         preds_list.append(pred_class.cpu().numpy())
         uncertainty_list.append(uncertainty.cpu().numpy())
-        evidence_list.append(evidence.cpu().numpy())
-        alpha_list.append(alpha.detach().cpu().numpy())
+        mass_list.append(mass.cpu().numpy())
     
     targs = np.concatenate(targs)
     probs = np.concatenate(probs_list)
@@ -603,10 +639,9 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
         'score': probs.tolist(),
         'pred': preds.tolist(),
         'uncertainty': np.concatenate(uncertainty_list).tolist(),
-        'evidence_0': np.concatenate(evidence_list)[:, 0].tolist(),
-        'evidence_1': np.concatenate(evidence_list)[:, 1].tolist(),
-        'alpha_0': np.concatenate(alpha_list)[:, 0].tolist(),
-        'alpha_1': np.concatenate(alpha_list)[:, 1].tolist(),
+        'mass_0': np.concatenate(mass_list)[:, 0].tolist(),
+        'mass_1': np.concatenate(mass_list)[:, 1].tolist(),
+        'mass_omega': np.concatenate(mass_list)[:, 2].tolist(),
     }
     
     return targs, preds, probs, val_stats, sample_results
@@ -639,7 +674,7 @@ def save_loss_curve(train_results, val_results, output_path):
         if key not in base_keys and len(values) == n_epochs:
             curve_data[f'val_{key}'] = values
     curve_df = pd.DataFrame(curve_data)
-    curve_df.to_csv(output_path / 'edl_loss_curve.csv', index=False)
+    curve_df.to_csv(output_path / 'dst_loss_curve.csv', index=False)
 
     try:
         import matplotlib
@@ -651,14 +686,14 @@ def save_loss_curve(train_results, val_results, output_path):
         ax.plot(curve_df['epoch'], curve_df['val_loss'], marker='o', label='Val Loss')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss')
-        ax.set_title('EDL Loss Curve')
+        ax.set_title('DST Loss Curve')
         ax.grid(True, alpha=0.3)
         ax.legend()
         fig.tight_layout()
-        fig.savefig(output_path / 'edl_loss_curve.png', dpi=200)
+        fig.savefig(output_path / 'dst_loss_curve.png', dpi=200)
         plt.close(fig)
     except Exception as exc:
-        print(f"[EDL] Warning: failed to save loss curve plot: {exc}")
+        print(f"[DST] Warning: failed to save loss curve plot: {exc}")
 
 
 def get_edl_class_weights(train_df, label_col):
@@ -667,11 +702,11 @@ def get_edl_class_weights(train_df, label_col):
     num_pos = int((labels == 1).sum())
     num_neg = int((labels == 0).sum())
     if num_pos <= 0:
-        print("[EDL] Warning: no positive samples in this training fold; using unweighted EDL CE.")
+        print("[DST] Warning: no positive samples in this training fold; using unweighted DST NLL.")
         return None
 
     pos_weight = float(num_neg / num_pos)
-    print(f"[EDL] Weighted CE enabled: neg={num_neg}, pos={num_pos}, pos_weight={pos_weight:.4f}")
+    print(f"[DST] Weighted NLL enabled: neg={num_neg}, pos={num_pos}, pos_weight={pos_weight:.4f}")
     return [1.0, pos_weight]
 
 
@@ -762,7 +797,7 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         if early_stop_patience > 0:
             if not annealing_complete:
                 print(
-                    "Early stopping paused until EDL annealing completes "
+                    "Early stopping paused until DST warmup completes "
                     f"(annealing={annealing_coeff:.3f})."
                 )
             else:
@@ -807,7 +842,7 @@ def do_edl_training(args, device):
     
   
     now = datetime.now().strftime('%Y-%m-%d')
-    args.output_path = Path(f"{args.output_dir}/EDL/{args.dataset}_{args.label}/fold_{args.n_folds}/{now}")
+    args.output_path = Path(f"{args.output_dir}/DST/{args.dataset}_{args.label}/fold_{args.n_folds}/{now}")
     os.makedirs(args.output_path, exist_ok=True)
     print(f"Output path: {args.output_path}")
     
@@ -831,7 +866,7 @@ def do_edl_training(args, device):
             val_frac=args.kfold0_val_frac,
             max_val_frac=args.kfold0_val_max_frac,
             args=args,
-            context="EDL n_folds=0 internal train/val split",
+            context="DST n_folds=0 internal train/val split",
         )
         split_iter = [(train_df, val_df)]
         total_folds = 1
@@ -855,7 +890,7 @@ def do_edl_training(args, device):
             continue
 
         print(f'\n{"="*60}')
-        print(f'  EDL Fold {fold} / {total_folds}')
+        print(f'  DST Fold {fold} / {total_folds}')
         print(f'{"="*60}')
         
         args.cur_fold = fold
@@ -873,11 +908,11 @@ def do_edl_training(args, device):
        
         pretrained_checkpoint = resolve_mil_checkpoint(args.resume, fold)
         if args.resume is not None and pretrained_checkpoint is None:
-            print(f"[EDL] Warning: no checkpoint found under {args.resume} for fold {fold}; training from scratch.")
+            print(f"[DST] Warning: no checkpoint found under {args.resume} for fold {fold}; training from scratch.")
         model = build_edl_model(args, pretrained_checkpoint)
         if args.train_edl_only:
             freeze_mil_backbone_train_edl_only(model)
-            print("[EDL] Freeze mode enabled: training only EDL head(s); MIL backbone is frozen.")
+            print("[DST] Freeze mode enabled: training only DST head(s); MIL backbone is frozen.")
         model.to(device)
         
         
@@ -958,10 +993,9 @@ def do_edl_training(args, device):
             pred_df['prediction_score'] = sample_results['score']
             pred_df['predicted_class'] = sample_results['pred']
             pred_df[label_col] = sample_results['label']
-            pred_df['evidence_0'] = sample_results['evidence_0']
-            pred_df['evidence_1'] = sample_results['evidence_1']
-            pred_df['alpha_0'] = sample_results['alpha_0']
-            pred_df['alpha_1'] = sample_results['alpha_1']
+            pred_df['mass_0'] = sample_results['mass_0']
+            pred_df['mass_1'] = sample_results['mass_1']
+            pred_df['mass_omega'] = sample_results['mass_omega']
             pred_df['uncertainty'] = sample_results['uncertainty']
             pred_df['fold'] = fold
             pred_df['split'] = split_name
@@ -974,7 +1008,7 @@ def do_edl_training(args, device):
             
             keep_cols = ['patient_id', 'image_id', 'split', 'cohort_num', label_col,
                         'prediction_score', 'predicted_class',
-                        'evidence_0', 'evidence_1', 'alpha_0', 'alpha_1', 'uncertainty', 'fold']
+                        'mass_0', 'mass_1', 'mass_omega', 'uncertainty', 'fold']
             keep_cols = [c for c in keep_cols if c in pred_df.columns]
             all_split_dfs.append(pred_df[keep_cols])
             
@@ -986,7 +1020,7 @@ def do_edl_training(args, device):
        
         if all_split_dfs:
             fold_pred_df = pd.concat(all_split_dfs, ignore_index=True)
-            fold_pred_df.to_csv(path_results_fold / f'{args.dataset}_edl_predictions_fold_{fold}.csv', index=False)
+            fold_pred_df.to_csv(path_results_fold / f'{args.dataset}_dst_predictions_fold_{fold}.csv', index=False)
             print(f"Saved fold {fold} predictions: {len(fold_pred_df)} samples")
         
         del model
@@ -1001,14 +1035,14 @@ def do_edl_training(args, device):
         mean_std['eval_source'] = 'summary'
         summary_df = pd.concat([summary_df, mean_std], ignore_index=True)
     
-    summary_df.to_csv(args.output_path / 'edl_results_summary.csv', index=False)
-    print(f"\nResults summary saved to {args.output_path / 'edl_results_summary.csv'}")
+    summary_df.to_csv(args.output_path / 'dst_results_summary.csv', index=False)
+    print(f"\nResults summary saved to {args.output_path / 'dst_results_summary.csv'}")
     print(summary_df.to_string())
     
  
     if fold_assignments:
         fold_df = pd.DataFrame(fold_assignments)
-        fold_df.to_csv(args.output_path / f'{args.dataset}_edl_val_fold_assignments.csv', index=False)
+        fold_df.to_csv(args.output_path / f'{args.dataset}_dst_val_fold_assignments.csv', index=False)
         print(f"Fold assignments saved ({len(fold_df)} validation samples)")
     
     return args.output_path
@@ -1016,6 +1050,7 @@ def do_edl_training(args, device):
 
 def main():
     args = config()
+    args.dst_normalize = args.dst_normalize == 'y'
     
   
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
@@ -1036,15 +1071,15 @@ def main():
     
 
     print("\n" + "=" * 60)
-    print("  Training complete. Starting automatic EDL testing...")
+    print("  Training complete. Starting automatic DST testing...")
     print("=" * 60)
     
     from edl_test import run_edl_test
     
-    test_output_dir = output_path / 'edl_test_results'
+    test_output_dir = output_path / 'dst_test_results'
     run_edl_test(args, device, checkpoint_dir=output_path, output_dir=test_output_dir)
     
-    print("\n===== EDL Training + Testing Pipeline Complete =====")
+    print("\n===== DST Training + Testing Pipeline Complete =====")
 
 
 if __name__ == "__main__":

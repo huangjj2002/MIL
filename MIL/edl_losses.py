@@ -8,6 +8,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
 
 def _parse_bool(value, name):
@@ -253,3 +254,75 @@ class EDLCombinedLoss(torch.nn.Module):
         self.last_stats = stats
 
         return total_loss, stats
+
+
+class DSTNLLLoss(nn.Module):
+    def __init__(self, class_weights=None, eps=1e-10):
+        super().__init__()
+        self.eps = float(eps)
+        if class_weights is None:
+            self.register_buffer("class_weights", None)
+        else:
+            self.register_buffer(
+                "class_weights",
+                torch.as_tensor(class_weights, dtype=torch.float32),
+            )
+        self.last_stats = {}
+
+    def get_annealing_coeff(self, epoch):
+        return 1.0
+
+    def forward(self, head_output, target, epoch=0):
+        prob = head_output["prob"].clamp(min=self.eps, max=1.0)
+        target_indices = target.long().to(prob.device)
+
+        weight = None
+        if self.class_weights is not None:
+            weight = self.class_weights.to(device=prob.device, dtype=prob.dtype)
+
+        loss = F.nll_loss(torch.log(prob), target_indices, weight=weight)
+        sample_weights = (
+            torch.ones_like(target_indices, dtype=prob.dtype)
+            if weight is None
+            else weight[target_indices]
+        )
+
+        mass = head_output.get("dst_mass")
+        if mass is None:
+            mass = prob.new_zeros(prob.size(0), prob.size(1) + 1)
+            mass[:, : prob.size(1)] = prob
+
+        stats = {
+            "nll_loss": _safe_float(loss),
+            "ce_loss": _safe_float(loss),
+            "data_loss": _safe_float(loss),
+            "kl_loss": 0.0,
+            "annealing": 1.0,
+            "wrong_evidence_penalty": 0.0,
+            "margin_violation_mean": 0.0,
+            "total_evidence_mean": _safe_float(mass[:, : prob.size(1)].sum(dim=1).mean()),
+            "focal_factor_mean": 1.0,
+            "sample_weight_mean": _safe_float(sample_weights.mean()),
+            "focal_weighted_denominator": _safe_float(sample_weights.sum()),
+            "mass_0_mean": _safe_float(mass[:, 0].mean()),
+            "mass_1_mean": _safe_float(mass[:, 1].mean()) if mass.size(1) > 1 else float("nan"),
+            "mass_omega_mean": _safe_float(mass[:, -1].mean()),
+            "total_loss": _safe_float(loss),
+        }
+
+        for class_idx in range(prob.size(1)):
+            class_mask = target_indices == class_idx
+            stats[f"class{class_idx}_n"] = int(class_mask.detach().sum().cpu())
+            if class_mask.any():
+                true_prob = prob[class_mask, class_idx].clamp(min=self.eps)
+                class_loss = -torch.log(true_prob).mean()
+                stats[f"class{class_idx}_nll_loss_mean"] = _safe_float(class_loss)
+                stats[f"class{class_idx}_mass_mean"] = _safe_float(
+                    mass[class_mask, class_idx].mean()
+                )
+            else:
+                stats[f"class{class_idx}_nll_loss_mean"] = float("nan")
+                stats[f"class{class_idx}_mass_mean"] = float("nan")
+
+        self.last_stats = stats
+        return loss, stats

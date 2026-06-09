@@ -63,10 +63,9 @@ def _reorder_prediction_columns(df, args):
         label_col,
         "prediction_score",
         "predicted_class",
-        "evidence_0",
-        "evidence_1",
-        "alpha_0",
-        "alpha_1",
+        "mass_0",
+        "mass_1",
+        "mass_omega",
         "uncertainty",
         "fold",
     ]
@@ -80,10 +79,9 @@ def _build_ensemble(test_all_df, args):
     agg_spec = {
         "prediction_score": "mean",
         "predicted_class": lambda x: (x.mean() >= 0.5).astype(int),
-        "evidence_0": "mean",
-        "evidence_1": "mean",
-        "alpha_0": "mean",
-        "alpha_1": "mean",
+        "mass_0": "mean",
+        "mass_1": "mean",
+        "mass_omega": "mean",
         "uncertainty": "mean",
         label_col: "first",
         "cohort_num": "first",
@@ -112,7 +110,7 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
     elif hasattr(args, "output_dir") and args.output_dir is not None:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = checkpoint_dir / "edl_proto_test_results"
+        output_dir = checkpoint_dir / "dst_proto_test_results"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seed_all(args.seed)
@@ -136,7 +134,7 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
     total_folds = 1 if single_internal_val else args.n_folds
     label_col = args.label.lower()
 
-    assignment_path = checkpoint_dir / f"{args.dataset}_edl_proto_val_fold_assignments.csv"
+    assignment_path = checkpoint_dir / f"{args.dataset}_dst_proto_val_fold_assignments.csv"
     fold_val_dfs = {}
     if assignment_path.exists():
         assignment_df = pd.read_csv(assignment_path)
@@ -149,7 +147,7 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
                 val_frac=args.kfold0_val_frac,
                 max_val_frac=args.kfold0_val_max_frac,
                 args=args,
-                context="EDL_PROTO test n_folds=0 internal train/val split",
+                context="DST_PROTO test n_folds=0 internal train/val split",
             )
             fold_val_dfs[0] = val_df_fold.reset_index(drop=True)
         else:
@@ -158,7 +156,7 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
             ):
                 fold_val_dfs[fold_idx] = val_df_fold.reset_index(drop=True)
 
-    print("\n===== Predicting on development data with Prototype+EDL =====")
+    print("\n===== Predicting on development data with Prototype-DST =====")
     all_dev_results = []
     dev_results_df = None
     test_ensemble = None
@@ -188,7 +186,7 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
             model,
             args,
             device,
-            desc=f"EDL_PROTO val fold {fold}",
+            desc=f"DST_PROTO val fold {fold}",
         )
         val_result_df = build_prediction_df(val_df, val_results, "val", fold, args)
         all_dev_results.append(val_result_df)
@@ -208,11 +206,11 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
 
     if all_dev_results:
         dev_results_df = pd.concat(all_dev_results, ignore_index=True)
-        dev_results_df.to_csv(output_dir / f"{args.dataset}_edl_proto_dev_predictions.csv", index=False)
+        dev_results_df.to_csv(output_dir / f"{args.dataset}_dst_proto_dev_predictions.csv", index=False)
         print(f"\nDev predictions saved: {len(dev_results_df)} samples")
 
     if len(test_df) > 0:
-        print("\n===== Predicting on test data with Prototype+EDL =====")
+        print("\n===== Predicting on test data with Prototype-DST =====")
         test_all_fold_results = []
 
         for fold in range(total_folds):
@@ -231,7 +229,7 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
                 model,
                 args,
                 device,
-                desc=f"EDL_PROTO test fold {fold}",
+                desc=f"DST_PROTO test fold {fold}",
             )
             test_result_df = build_prediction_df(test_df, test_results, "test", fold, args)
             test_all_fold_results.append(test_result_df)
@@ -251,10 +249,10 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
 
         if test_all_fold_results:
             test_all_df = pd.concat(test_all_fold_results, ignore_index=True)
-            test_all_df.to_csv(output_dir / f"{args.dataset}_edl_proto_test_all_folds.csv", index=False)
+            test_all_df.to_csv(output_dir / f"{args.dataset}_dst_proto_test_all_folds.csv", index=False)
 
             test_ensemble = _build_ensemble(test_all_df, args)
-            test_ensemble.to_csv(output_dir / f"{args.dataset}_edl_proto_test_ensemble.csv", index=False)
+            test_ensemble.to_csv(output_dir / f"{args.dataset}_dst_proto_test_ensemble.csv", index=False)
 
             targs_ens = test_ensemble[label_col].values
             probs_ens = test_ensemble["prediction_score"].values.astype(float)
@@ -274,13 +272,13 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
         combined_df = None
 
     if combined_df is not None:
-        combined_df.to_csv(output_dir / f"{args.dataset}_edl_proto_all_predictions.csv", index=False)
+        combined_df.to_csv(output_dir / f"{args.dataset}_dst_proto_all_predictions.csv", index=False)
         print(
             f"\nCombined predictions saved: {len(combined_df)} samples -> "
-            f"{output_dir / f'{args.dataset}_edl_proto_all_predictions.csv'}"
+            f"{output_dir / f'{args.dataset}_dst_proto_all_predictions.csv'}"
         )
 
-    print("\n===== Prototype+EDL Test Complete =====")
+    print("\n===== Prototype-DST Test Complete =====")
     return output_dir
 
 

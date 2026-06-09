@@ -1,15 +1,24 @@
 import numpy as np
 import pandas as pd
 import pickle
+import random
 import torch
 import torchvision
 import torchvision.transforms
 import torch.nn.functional as F
-from albumentations import *
 from torch.utils.data import DataLoader
 import cv2
 
-from .dataset_concepts import Generic_MIL_Dataset_Detection, collate_MIL_patches_detection, Generic_MIL_Dataset, collate_MIL_patches, BagDataset, collate_patch_features
+from .dataset_concepts import (
+    BagDataset,
+    BagEmbeddingDataset,
+    Generic_MIL_Dataset,
+    Generic_MIL_Dataset_Detection,
+    collate_MIL_patches,
+    collate_MIL_patches_detection,
+    collate_bag_embeddings,
+    collate_patch_features,
+)
 
 from utils.generic_utils import clear_memory
 
@@ -348,6 +357,18 @@ def MIL_dataloader(split_df, split, args):
         DataLoader: Configured DataLoader for the specified split and settings.
     """
 
+    if args.feature_extraction == "bag_embedding":
+        split_dataset = BagEmbeddingDataset(args=args, df=split_df)
+        return DataLoader(
+            split_dataset,
+            batch_size=args.batch_size,
+            shuffle=split == "train",
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=split == "train",
+            collate_fn=collate_bag_embeddings,
+        )
+
     # Define Transformations
     if args.feature_extraction == 'online': 
         # Online feature extraction 
@@ -415,4 +436,3 @@ def MIL_dataloader(split_df, split, args):
         )
 
     return loader 
-

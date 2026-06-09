@@ -1,16 +1,25 @@
 from collections import defaultdict
 
 import cv2
+import json
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from imgaug.augmentables.bbs import BoundingBox, BoundingBoxesOnImage
 from torch.utils.data import Dataset
 
+try:
+    from imgaug.augmentables.bbs import BoundingBox, BoundingBoxesOnImage
+except ModuleNotFoundError:
+    BoundingBox = None
+    BoundingBoxesOnImage = None
+
 import os 
-import h5py
+try:
+    import h5py
+except ModuleNotFoundError:
+    h5py = None
 
 import json
 import ast
@@ -18,6 +27,102 @@ import ast
 def convert_to_float_list(string_list):
     # Strip brackets and split by comma, then convert to floats
     return [float(value) for value in string_list.strip('[]').split(', ')]
+
+
+class BagEmbeddingDataset(Dataset):
+    def __init__(self, args, df):
+        self.args = args
+        self.df = df.reset_index(drop=True)
+        self.label = args.label
+        self.cache_dir = getattr(args, "embedding_cache_dir", None)
+        if self.cache_dir is None:
+            raise ValueError("--embedding_cache_dir is required when --feature_extraction bag_embedding.")
+        self.cache_dir = os.fspath(self.cache_dir)
+
+        manifest_path = os.path.join(self.cache_dir, "manifest.json")
+        metadata_path = os.path.join(self.cache_dir, "metadata.csv")
+        embeddings_path = os.path.join(self.cache_dir, "embeddings.npy")
+
+        if not os.path.exists(manifest_path):
+            raise FileNotFoundError(f"Bag embedding manifest not found: {manifest_path}")
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Bag embedding metadata not found: {metadata_path}")
+        if not os.path.exists(embeddings_path):
+            raise FileNotFoundError(f"Bag embeddings not found: {embeddings_path}")
+
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        embedding_level = manifest.get("embedding_level")
+        if embedding_level != "bag_origin":
+            raise ValueError(
+                "bag_embedding mode expects an extract_origin_embeddings.py cache "
+                f"with embedding_level='bag_origin', got {embedding_level!r}."
+            )
+
+        import pandas as pd
+
+        self.metadata = pd.read_csv(metadata_path).fillna(0)
+        self.embeddings = np.load(embeddings_path, mmap_mode="r")
+        if self.embeddings.ndim != 2:
+            raise ValueError(f"Expected embeddings.npy to be 2D, got shape {self.embeddings.shape}.")
+        self.embedding_dim = int(self.embeddings.shape[1])
+
+        self.index = {}
+        for row_idx, row in self.metadata.iterrows():
+            key = self._make_key(row)
+            if key not in self.index:
+                self.index[key] = row_idx
+
+    @staticmethod
+    def _normalize_id(value):
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        return str(value)
+
+    def _make_key(self, row):
+        if "patient_id" not in row or "image_id" not in row:
+            raise ValueError("Bag embedding metadata must contain patient_id and image_id columns.")
+        return (
+            self._normalize_id(row["patient_id"]),
+            self._normalize_id(row["image_id"]),
+        )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        key = self._make_key(row)
+        if key not in self.index:
+            raise KeyError(
+                f"Could not find bag_origin embedding for patient_id={key[0]}, image_id={key[1]}."
+            )
+
+        meta_row = self.metadata.iloc[self.index[key]]
+        start = int(meta_row["embedding_start"])
+        end = int(meta_row["embedding_end"])
+        if end - start != 1:
+            raise ValueError(
+                "bag_origin cache must contain exactly one embedding row per image; "
+                f"got {end - start} rows for patient_id={key[0]}, image_id={key[1]}."
+            )
+
+        x = torch.as_tensor(np.asarray(self.embeddings[start], dtype=np.float32))
+        return {
+            "x": x,
+            "y": torch.tensor(row[self.label], dtype=torch.long),
+            "patient_id": key[0],
+            "image_id": key[1],
+        }
+
+
+def collate_bag_embeddings(batch):
+    return {
+        "x": torch.stack([item["x"] for item in batch]),
+        "y": torch.from_numpy(np.array([int(item["y"]) for item in batch], dtype=np.float32)),
+        "patient_id": [item["patient_id"] for item in batch],
+        "image_id": [item["image_id"] for item in batch],
+    }
     
 
 def filter_bounding_boxes(finding_categories, boxes, label_name):
@@ -159,6 +264,8 @@ class Generic_MIL_Dataset(Dataset):
         Returns:
             torch.Tensor: Sorted instance features tensor.
         """
+        if h5py is None:
+            raise ModuleNotFoundError("h5py is required for offline patch feature loading.")
 
         # Load patch features tensor
         if feat_pyramid_level is None:
@@ -381,6 +488,8 @@ class Generic_MIL_Dataset_Detection(Dataset):
             bag_coords: Numpy array of patch coordinates sorted spatially.
             bag_info: Dictionary of additional info about the patch coordinates.
         """
+        if h5py is None:
+            raise ModuleNotFoundError("h5py is required for offline patch feature loading.")
 
         # Load the patch features tensor 
         if feat_pyramid_level is None:
@@ -573,6 +682,3 @@ def collate_MIL_patches_detection(batch):
         'bag_info': [item['bag_info'] for item in batch],
         'boxes': np.vstack([item['boxes'] for item in batch])
     }
-
-
-

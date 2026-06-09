@@ -20,12 +20,13 @@ from tqdm import tqdm
 
 from Datasets.dataset_utils import MIL_dataloader
 from MIL import build_model
-from MIL.edl_proto_models import MIL_EDL_Prototype_Wrapper
+from MIL.edl_proto_models import BagEmbeddingPrototypeDSTModel, MIL_EDL_Prototype_Wrapper
 from edl_train import (
     LinearWarmupCosineAnnealingLR,
     EDL_LOSS_DIAGNOSTIC_KEYS,
     _append_epoch_stats,
     _get_checkpoint_state_dict,
+    _infer_bag_embedding_dim,
     _init_epoch_history,
     _loss_meter_averages,
     _new_loss_meters,
@@ -55,6 +56,8 @@ def _add_proto_args(parser):
                         help="Number of top prototypes exported per class.")
     parser.add_argument("--edl_proto_gamma_init", default=1.0, type=float,
                         help="Initial distance sharpness for prototype similarity.")
+    parser.add_argument("--edl_proto_alpha_init", default=0.0, type=float,
+                        help="Initial DST prototype reliability logit.")
     parser.add_argument("--edl_proto_normalize", default="y", choices=["y", "n"],
                         help="Normalize embeddings and prototypes before distance computation.")
     parser.add_argument("--edl_proto_init", default="kmeans", choices=["kmeans", "random"],
@@ -99,7 +102,13 @@ def _looks_like_edl_proto_state_dict(state_dict):
     if not isinstance(state_dict, dict):
         return False
     return any(
-        ("prototypes" in key or "proto_strength" in key or "raw_gamma" in key)
+        (
+            "ds_module" in key
+            or "prototype" in key
+            or "prototypes" in key
+            or "proto_strength" in key
+            or "raw_gamma" in key
+        )
         for key in state_dict.keys()
     )
 
@@ -113,8 +122,6 @@ def build_edl_proto_model(args, checkpoint_path=None):
             "so the Mammo-CLIP image encoder/backbone can be initialized."
         )
 
-    mil_model = build_model(args)
-
     checkpoint_state = None
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
@@ -122,15 +129,33 @@ def build_edl_proto_model(args, checkpoint_path=None):
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             checkpoint_state = _get_checkpoint_state_dict(checkpoint)
         else:
-            print(f"[EDL_PROTO] Warning: checkpoint not found at {checkpoint_path}; training from scratch.")
+            print(f"[DST_PROTO] Warning: checkpoint not found at {checkpoint_path}; training from scratch.")
 
     is_wrapped_checkpoint = _looks_like_wrapped_state_dict(checkpoint_state)
     is_proto_checkpoint = _looks_like_edl_proto_state_dict(checkpoint_state)
 
+    if args.feature_extraction == "bag_embedding":
+        model = BagEmbeddingPrototypeDSTModel(
+            in_features=_infer_bag_embedding_dim(args),
+            edl_dropout=args.edl_dropout,
+            proto_k=args.edl_proto_k,
+            proto_topk=args.edl_proto_topk,
+            proto_normalize=args.edl_proto_normalize,
+            proto_gamma_init=args.edl_proto_gamma_init,
+            proto_alpha_init=args.edl_proto_alpha_init,
+        )
+        if checkpoint_state is not None:
+            load_msg = model.load_state_dict(checkpoint_state, strict=False)
+            print(f"[DST_PROTO] Loaded Prototype-DST checkpoint from: {checkpoint_path}")
+            _print_load_summary("[DST_PROTO][load]", load_msg)
+        return model, checkpoint_state is not None and is_proto_checkpoint
+
+    mil_model = build_model(args)
+
     if checkpoint_state is not None and not is_wrapped_checkpoint:
         load_msg = mil_model.load_state_dict(checkpoint_state, strict=False)
-        print(f"[EDL_PROTO] Loaded pretrained MIL backbone from: {checkpoint_path}")
-        _print_load_summary("[EDL_PROTO][MIL load]", load_msg)
+        print(f"[DST_PROTO] Loaded pretrained MIL backbone from: {checkpoint_path}")
+        _print_load_summary("[DST_PROTO][MIL load]", load_msg)
 
     model = MIL_EDL_Prototype_Wrapper(
         mil_model,
@@ -139,18 +164,19 @@ def build_edl_proto_model(args, checkpoint_path=None):
         proto_topk=args.edl_proto_topk,
         proto_normalize=args.edl_proto_normalize,
         proto_gamma_init=args.edl_proto_gamma_init,
+        proto_alpha_init=args.edl_proto_alpha_init,
     )
 
     if checkpoint_state is not None and is_wrapped_checkpoint:
         load_msg = model.load_state_dict(checkpoint_state, strict=False)
         if is_proto_checkpoint:
-            print(f"[EDL_PROTO] Loaded Prototype+EDL checkpoint from: {checkpoint_path}")
+            print(f"[DST_PROTO] Loaded Prototype-DST checkpoint from: {checkpoint_path}")
         else:
             print(
-                "[EDL_PROTO] Loaded wrapped EDL backbone weights; "
+                "[DST_PROTO] Loaded wrapped DST backbone weights; "
                 "prototype heads will be initialized separately."
             )
-        _print_load_summary("[EDL_PROTO][wrapped load]", load_msg)
+        _print_load_summary("[DST_PROTO][wrapped load]", load_msg)
 
     return model, is_proto_checkpoint
 
@@ -164,7 +190,9 @@ def _move_inputs_to_device(data, device, non_blocking=True):
 
 
 def _zero_like_loss(edl_out):
-    return edl_out["alpha"].sum() * 0.0
+    if "dst_mass" in edl_out:
+        return edl_out["dst_mass"].sum() * 0.0
+    return edl_out["prob"].sum() * 0.0
 
 
 def _single_output_proto_reg(edl_out, labels, margin, balance_classes=True):
@@ -311,7 +339,7 @@ def prototype_regularization_loss(model, edl_out, labels, args):
 
 def keep_frozen_mil_backbone_in_eval(model, args):
 
-    if getattr(args, "train_edl_only", False):
+    if getattr(args, "train_edl_only", False) and hasattr(model, "mil_model"):
         model.mil_model.eval()
 
 
@@ -332,7 +360,7 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
 
     progress_iter = tqdm(
         enumerate(train_loader),
-        desc=f"[{epoch + 1:03d}/{args.epochs:03d} EDL_PROTO train]",
+        desc=f"[{epoch + 1:03d}/{args.epochs:03d} DST_PROTO train]",
         total=len(train_loader),
     )
 
@@ -348,10 +376,9 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
         amp_enabled = bool(args.apex) and device.type == "cuda"
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             edl_out = model(inputs)
-            alpha = edl_out["alpha"]
-            loss, loss_dict = criterion(alpha, labels, epoch=epoch)
+            loss, loss_dict = criterion(edl_out, labels, epoch=epoch)
             for side_out in edl_out.get("side_outputs", {}).values():
-                side_loss, _ = criterion(side_out["alpha"], labels, epoch=epoch)
+                side_loss, _ = criterion(side_out, labels, epoch=epoch)
                 loss = loss + side_loss
 
             proto_reg, proto_dict = prototype_regularization_loss(model, edl_out, labels, args)
@@ -389,7 +416,7 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
             "kl": f"{kl_losses.avg:.4f}",
             "wep": f"{loss_meters['wrong_evidence_penalty'].avg:.4f}",
             "viol": f"{loss_meters['margin_violation_mean'].avg:.4f}",
-            "evid": f"{loss_meters['total_evidence_mean'].avg:.4f}",
+            "omega": f"{loss_meters['mass_omega_mean'].avg:.4f}",
             "proto": f"{proto_losses.avg:.4f}",
             "attr": f"{proto_attract_losses.avg:.4f}",
             "sep": f"{proto_separation_losses.avg:.4f}",
@@ -544,15 +571,15 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
 @torch.no_grad()
 def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
     if args.edl_proto_init != "kmeans":
-        print("[EDL_PROTO] Prototype KMeans initialization skipped; using random init.")
+        print("[DST_PROTO] Prototype KMeans initialization skipped; using random init.")
         return
 
     heads = model.prototype_heads()
     if not heads:
-        print("[EDL_PROTO] No prototype heads found; skipping initialization.")
+        print("[DST_PROTO] No prototype heads found; skipping initialization.")
         return
 
-    print("[EDL_PROTO] Initializing prototypes with train-fold KMeans embeddings...")
+    print("[DST_PROTO] Initializing prototypes with train-fold KMeans embeddings...")
     init_loader = MIL_dataloader(train_df, "test", args)
     buckets = {
         name: {"embeddings": [], "labels": []}
@@ -579,7 +606,7 @@ def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
     amp_enabled = bool(args.apex) and device.type == "cuda"
 
     try:
-        progress_iter = tqdm(init_loader, desc=f"[fold {fold} EDL_PROTO init]", total=len(init_loader))
+        progress_iter = tqdm(init_loader, desc=f"[fold {fold} DST_PROTO init]", total=len(init_loader))
         for data in progress_iter:
             current_labels = data["y"].long().to(device)
             inputs = _move_inputs_to_device(data, device, non_blocking=True)
@@ -599,11 +626,11 @@ def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
             random_state=args.seed + fold,
         )
         print(
-            f"[EDL_PROTO] {name}: initialized {head.num_classes * head.prototypes_per_class} "
+            f"[DST_PROTO] {name}: initialized {head.num_classes * head.prototypes_per_class} "
             f"prototypes from {len(labels)} training embeddings."
         )
         for warning_text in warnings_list:
-            print(f"[EDL_PROTO] Warning: {name}: {warning_text}")
+            print(f"[DST_PROTO] Warning: {name}: {warning_text}")
 
 
 def expected_proto_columns(args):
@@ -615,6 +642,7 @@ def expected_proto_columns(args):
             columns.extend([
                 f"{prefix}_idx",
                 f"{prefix}_evidence",
+                f"{prefix}_mass",
                 f"{prefix}_similarity",
             ])
     return columns
@@ -633,11 +661,12 @@ def _append_proto_batch(proto_buffers, edl_out):
             prefix = f"proto_c{class_idx}_top{rank_idx + 1}"
             proto_buffers.setdefault(f"{prefix}_idx", []).append(top_idx[:, class_idx, rank_idx])
             proto_buffers.setdefault(f"{prefix}_evidence", []).append(top_evidence[:, class_idx, rank_idx])
+            proto_buffers.setdefault(f"{prefix}_mass", []).append(top_evidence[:, class_idx, rank_idx])
             proto_buffers.setdefault(f"{prefix}_similarity", []).append(top_similarity[:, class_idx, rank_idx])
 
 
 @torch.no_grad()
-def edl_proto_predict(loader, model, args, device, desc="EDL_PROTO predict"):
+def edl_proto_predict(loader, model, args, device, desc="DST_PROTO predict"):
     model.eval()
     model.is_training = False
 
@@ -645,8 +674,7 @@ def edl_proto_predict(loader, model, args, device, desc="EDL_PROTO predict"):
     probs_list = []
     preds_list = []
     uncertainty_list = []
-    evidence_list = []
-    alpha_list = []
+    mass_list = []
     proto_buffers = {}
     sample_patient_ids = []
     sample_image_ids = []
@@ -671,8 +699,7 @@ def edl_proto_predict(loader, model, args, device, desc="EDL_PROTO predict"):
             edl_out = model(inputs)
 
         prob = edl_out["prob"].detach().cpu()
-        evidence = edl_out["evidence"].detach().cpu()
-        alpha = edl_out["alpha"].detach().cpu()
+        mass = edl_out["dst_mass"].detach().cpu()
         uncertainty = edl_out["uncertainty"].detach().cpu()
         pred_class = torch.argmax(prob, dim=-1)
 
@@ -680,12 +707,10 @@ def edl_proto_predict(loader, model, args, device, desc="EDL_PROTO predict"):
         probs_list.append(prob[:, 1].numpy())
         preds_list.append(pred_class.numpy())
         uncertainty_list.append(uncertainty.numpy())
-        evidence_list.append(evidence.numpy())
-        alpha_list.append(alpha.numpy())
+        mass_list.append(mass.numpy())
         _append_proto_batch(proto_buffers, edl_out)
 
-    evidence_array = np.concatenate(evidence_list)
-    alpha_array = np.concatenate(alpha_list)
+    mass_array = np.concatenate(mass_list)
     results = {
         "patient_id": sample_patient_ids,
         "image_id": sample_image_ids,
@@ -693,10 +718,9 @@ def edl_proto_predict(loader, model, args, device, desc="EDL_PROTO predict"):
         "score": np.concatenate(probs_list).tolist(),
         "pred": np.concatenate(preds_list).tolist(),
         "uncertainty": np.concatenate(uncertainty_list).tolist(),
-        "evidence_0": evidence_array[:, 0].tolist(),
-        "evidence_1": evidence_array[:, 1].tolist(),
-        "alpha_0": alpha_array[:, 0].tolist(),
-        "alpha_1": alpha_array[:, 1].tolist(),
+        "mass_0": mass_array[:, 0].tolist(),
+        "mass_1": mass_array[:, 1].tolist(),
+        "mass_omega": mass_array[:, 2].tolist(),
     }
 
     for key, chunks in proto_buffers.items():
@@ -711,10 +735,9 @@ def build_prediction_df(split_df, sample_results, split_name, fold, args):
     pred_df["prediction_score"] = sample_results["score"]
     pred_df["predicted_class"] = sample_results["pred"]
     pred_df[label_col] = sample_results["label"]
-    pred_df["evidence_0"] = sample_results["evidence_0"]
-    pred_df["evidence_1"] = sample_results["evidence_1"]
-    pred_df["alpha_0"] = sample_results["alpha_0"]
-    pred_df["alpha_1"] = sample_results["alpha_1"]
+    pred_df["mass_0"] = sample_results["mass_0"]
+    pred_df["mass_1"] = sample_results["mass_1"]
+    pred_df["mass_omega"] = sample_results["mass_omega"]
     pred_df["uncertainty"] = sample_results["uncertainty"]
     pred_df["fold"] = fold
     pred_df["split"] = split_name
@@ -737,10 +760,9 @@ def build_prediction_df(split_df, sample_results, split_name, fold, args):
         label_col,
         "prediction_score",
         "predicted_class",
-        "evidence_0",
-        "evidence_1",
-        "alpha_0",
-        "alpha_1",
+        "mass_0",
+        "mass_1",
+        "mass_omega",
         "uncertainty",
         "fold",
     ]
@@ -771,7 +793,7 @@ def do_edl_proto_training(args, device):
         dev_df = dev_df.sample(frac=args.data_frac, random_state=1, ignore_index=True)
 
     now = datetime.now().strftime("%Y-%m-%d")
-    args.output_path = Path(f"{args.output_dir}/EDL_PROTO/{args.dataset}_{args.label}/fold_{args.n_folds}/{now}")
+    args.output_path = Path(f"{args.output_dir}/DST_PROTO/{args.dataset}_{args.label}/fold_{args.n_folds}/{now}")
     os.makedirs(args.output_path, exist_ok=True)
     print(f"Output path: {args.output_path}")
 
@@ -794,7 +816,7 @@ def do_edl_proto_training(args, device):
             val_frac=args.kfold0_val_frac,
             max_val_frac=args.kfold0_val_max_frac,
             args=args,
-            context="EDL_PROTO n_folds=0 internal train/val split",
+            context="DST_PROTO n_folds=0 internal train/val split",
         )
         split_iter = [(train_df, val_df)]
         total_folds = 1
@@ -815,7 +837,7 @@ def do_edl_proto_training(args, device):
             continue
 
         print(f'\n{"=" * 60}')
-        print(f"  EDL_PROTO Fold {fold} / {total_folds}")
+        print(f"  DST_PROTO Fold {fold} / {total_folds}")
         print(f'{"=" * 60}')
 
         args.cur_fold = fold
@@ -832,7 +854,7 @@ def do_edl_proto_training(args, device):
 
         pretrained_checkpoint = resolve_mil_checkpoint(args.resume, fold)
         if args.resume is not None and pretrained_checkpoint is None:
-            print(f"[EDL_PROTO] Warning: no checkpoint found under {args.resume} for fold {fold}; training from scratch.")
+            print(f"[DST_PROTO] Warning: no checkpoint found under {args.resume} for fold {fold}; training from scratch.")
 
         model, loaded_proto_checkpoint = build_edl_proto_model(args, pretrained_checkpoint)
         model.to(device)
@@ -842,7 +864,7 @@ def do_edl_proto_training(args, device):
 
         if args.train_edl_only:
             freeze_mil_backbone_train_edl_only(model)
-            print("[EDL_PROTO] Freeze mode enabled: training only prototype EDL head(s); MIL backbone is frozen.")
+            print("[DST_PROTO] Freeze mode enabled: training only prototype DST head(s); MIL backbone is frozen.")
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -850,7 +872,7 @@ def do_edl_proto_training(args, device):
 
         trainable_parameters = [p for p in model.parameters() if p.requires_grad]
         if not trainable_parameters:
-            raise RuntimeError("No trainable parameters found. Check the Prototype+EDL freeze configuration.")
+            raise RuntimeError("No trainable parameters found. Check the Prototype-DST freeze configuration.")
 
         optimizer = torch.optim.AdamW(
             trainable_parameters,
@@ -901,7 +923,7 @@ def do_edl_proto_training(args, device):
                 fold_summary[key] = val_stats[key]
         all_val_results.append(fold_summary)
 
-        print(f"\nGenerating Prototype+EDL predictions with best model for fold {fold}...")
+        print(f"\nGenerating Prototype-DST predictions with best model for fold {fold}...")
         checkpoint = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         model.eval()
@@ -918,7 +940,7 @@ def do_edl_proto_training(args, device):
                 model,
                 args,
                 device,
-                desc=f"EDL_PROTO {split_name} predict",
+                desc=f"DST_PROTO {split_name} predict",
             )
             pred_df = build_prediction_df(split_df, sample_results, split_name, fold, args)
             all_split_dfs.append(pred_df)
@@ -930,10 +952,10 @@ def do_edl_proto_training(args, device):
         if all_split_dfs:
             fold_pred_df = pd.concat(all_split_dfs, ignore_index=True)
             fold_pred_df.to_csv(
-                path_results_fold / f"{args.dataset}_edl_proto_predictions_fold_{fold}.csv",
+                path_results_fold / f"{args.dataset}_dst_proto_predictions_fold_{fold}.csv",
                 index=False,
             )
-            print(f"Saved fold {fold} Prototype+EDL predictions: {len(fold_pred_df)} samples")
+            print(f"Saved fold {fold} Prototype-DST predictions: {len(fold_pred_df)} samples")
 
         del model
         clear_memory()
@@ -946,14 +968,14 @@ def do_edl_proto_training(args, device):
         mean_std["eval_source"] = "summary"
         summary_df = pd.concat([summary_df, mean_std], ignore_index=True)
 
-    summary_df.to_csv(args.output_path / "edl_proto_results_summary.csv", index=False)
-    print(f"\nResults summary saved to {args.output_path / 'edl_proto_results_summary.csv'}")
+    summary_df.to_csv(args.output_path / "dst_proto_results_summary.csv", index=False)
+    print(f"\nResults summary saved to {args.output_path / 'dst_proto_results_summary.csv'}")
     print(summary_df.to_string())
 
     if fold_assignments:
         fold_df = pd.DataFrame(fold_assignments)
         fold_df.to_csv(
-            args.output_path / f"{args.dataset}_edl_proto_val_fold_assignments.csv",
+            args.output_path / f"{args.dataset}_dst_proto_val_fold_assignments.csv",
             index=False,
         )
         print(f"Fold assignments saved ({len(fold_df)} validation samples)")
@@ -981,15 +1003,15 @@ def main():
     output_path = do_edl_proto_training(args, device)
 
     print("\n" + "=" * 60)
-    print("  Training complete. Starting automatic Prototype+EDL testing...")
+    print("  Training complete. Starting automatic Prototype-DST testing...")
     print("=" * 60)
 
     from edl_proto_test import run_edl_proto_test
 
-    test_output_dir = output_path / "edl_proto_test_results"
+    test_output_dir = output_path / "dst_proto_test_results"
     run_edl_proto_test(args, device, checkpoint_dir=output_path, output_dir=test_output_dir)
 
-    print("\n===== Prototype+EDL Training + Testing Pipeline Complete =====")
+    print("\n===== Prototype-DST Training + Testing Pipeline Complete =====")
 
 
 if __name__ == "__main__":

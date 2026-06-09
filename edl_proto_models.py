@@ -1,17 +1,51 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 
-from MIL.dst_layers import (
-    DempsterShaferModule,
-    DistanceActivationLayer,
-    dst_activation_init_alpha,
-    dst_activation_init_gamma,
-    pignistic,
-)
 from MIL.edl_models import MIL_EDL_Wrapper
+from dst_pytorch import Dempster_Shafer_Module, DistanceActivation_layer
+
+
+def dst_activation_init_gamma(gamma_init):
+    """Map distance-decay rate to DistanceActivation_layer eta init.
+
+    DistanceActivation_layer uses ``exp(-eta^2 * distance)``, so
+    ``eta_init = sqrt(gamma_init)`` gives ``eta^2 == gamma_init``.
+    """
+    return math.sqrt(max(float(gamma_init), 1e-6))
+
+
+def dst_activation_init_alpha(alpha_init):
+    """Pass-through for DistanceActivation_layer xi.weight init.
+
+    xi is initialized to this value; the forward multiplier is sigmoid(xi).
+    """
+    return float(alpha_init)
+
+
+def pignistic(mass, n_class):
+    """Convert normalized DST mass to probabilistic outputs (train_enn style)."""
+    class_mass = mass[..., :n_class]
+    omega = mass[..., n_class]
+    probs = class_mass + (1.0 / n_class) * omega.unsqueeze(-1)
+    return probs, omega
+
+
+class PrototypeDSTNLLLoss(nn.Module):
+    """NLL on pignistic probabilities, matching train_enn.py main loss."""
+
+    def __init__(self, weight=None, eps=1e-10):
+        super().__init__()
+        self.nll_loss = nn.NLLLoss(weight=weight)
+        self.eps = eps
+
+    def forward(self, head_output, targets):
+        probs = head_output["prob"].clamp(min=self.eps)
+        return self.nll_loss(torch.log(probs), targets)
 
 
 class PrototypeEDLHead(nn.Module):
@@ -30,7 +64,7 @@ class PrototypeEDLHead(nn.Module):
     ):
         super().__init__()
         if num_classes != 2:
-            raise ValueError("PrototypeEDLHead currently expects binary output.")
+            raise ValueError("PrototypeEDLHead currently expects binary EDL output.")
         if prototypes_per_class < 1:
             raise ValueError("prototypes_per_class must be >= 1.")
 
@@ -40,40 +74,56 @@ class PrototypeEDLHead(nn.Module):
         self.n_prototypes = self.num_classes * self.prototypes_per_class
         self.topk = int(topk)
         self.normalize = bool(normalize)
+        self.gamma_init = float(gamma_init)
+        self.alpha_init = float(alpha_init)
         self.drop = nn.Dropout(p=dropout)
 
-        self.ds_module = DempsterShaferModule(
+        init_gamma = dst_activation_init_gamma(self.gamma_init)
+        init_alpha = dst_activation_init_alpha(self.alpha_init)
+        self.ds_module = Dempster_Shafer_Module(
             n_feature_maps=self.in_features,
             n_classes=self.num_classes,
             n_prototypes=self.n_prototypes,
         )
-        self.ds_module.ds1_activate = DistanceActivationLayer(
+        self.ds_module.ds1_activate = DistanceActivation_layer(
             n_prototypes=self.n_prototypes,
-            init_alpha=dst_activation_init_alpha(alpha_init),
-            init_gamma=dst_activation_init_gamma(gamma_init),
+            init_alpha=init_alpha,
+            init_gamma=init_gamma,
         )
         self.reset_parameters()
 
     @property
     def prototypes(self):
         return self.ds_module.ds1.w.view(
-            self.num_classes,
-            self.prototypes_per_class,
-            self.in_features,
+            self.num_classes, self.prototypes_per_class, self.in_features
         )
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.ds_module.ds1.w)
 
+    def _compute_distances(self, x):
+        prototypes = self.ds_module.ds1.w
+        if self.normalize:
+            x = F.normalize(x, dim=-1)
+            prototypes = F.normalize(prototypes, dim=-1)
+        return (x[:, None, :] - prototypes[None, :, :]).pow(2).sum(dim=-1)
+
+    def _reshape_prototypes(self, tensor):
+        batch_size = tensor.shape[0]
+        return tensor.view(batch_size, self.num_classes, self.prototypes_per_class)
+
     def forward(self, x):
-        x = self.drop(x.float())
-        mass, distances, similarity, mass_prototypes = self.ds_module(
-            x,
-            normalize=self.normalize,
-        )
+        x = self.drop(x)
+        distances = self._compute_distances(x)
+        ed_ac = self.ds_module.ds1_activate(distances)
+        mass_prototypes = self.ds_module.ds2(ed_ac)
+        mass_prototypes_omega = self.ds_module.ds2_omega(mass_prototypes)
+        mass_dempster = self.ds_module.ds3_dempster(mass_prototypes_omega)
+        mass = self.ds_module.ds3_normalize(mass_dempster)
+
         prob, uncertainty = pignistic(mass, self.num_classes)
 
-        prototype_mass = torch.zeros(
+        prototype_evidence = torch.zeros(
             x.shape[0],
             self.num_classes,
             self.prototypes_per_class,
@@ -83,39 +133,29 @@ class PrototypeEDLHead(nn.Module):
         for class_idx in range(self.num_classes):
             start = class_idx * self.prototypes_per_class
             end = start + self.prototypes_per_class
-            prototype_mass[:, class_idx, :] = mass_prototypes[:, start:end, class_idx]
+            prototype_evidence[:, class_idx, :] = mass_prototypes[:, start:end, class_idx]
 
-        distances_by_class = distances.view(
-            x.shape[0],
-            self.num_classes,
-            self.prototypes_per_class,
-        )
-        similarity_by_class = similarity.view(
-            x.shape[0],
-            self.num_classes,
-            self.prototypes_per_class,
-        )
+        distances_by_class = self._reshape_prototypes(distances)
+        similarity = self._reshape_prototypes(ed_ac)
 
         out = {
             "prob": prob,
             "uncertainty": uncertainty,
             "dst_mass": mass,
             "prototype_distances": distances_by_class,
-            "prototype_similarity": similarity_by_class,
-            "prototype_evidence": prototype_mass,
-            "prototype_mass": prototype_mass,
+            "prototype_similarity": similarity,
+            "prototype_evidence": prototype_evidence,
         }
 
         if self.topk > 0:
             topk = min(self.topk, self.prototypes_per_class)
-            top_mass, top_idx = torch.topk(prototype_mass, k=topk, dim=-1)
-            top_similarity = torch.gather(similarity_by_class, dim=-1, index=top_idx)
+            top_evidence, top_idx = torch.topk(prototype_evidence, k=topk, dim=-1)
+            top_similarity = torch.gather(similarity, dim=-1, index=top_idx)
             top_distances = torch.gather(distances_by_class, dim=-1, index=top_idx)
             out.update(
                 {
                     "topk_proto_idx": top_idx,
-                    "topk_proto_evidence": top_mass,
-                    "topk_proto_mass": top_mass,
+                    "topk_proto_evidence": top_evidence,
                     "topk_proto_similarity": top_similarity,
                     "topk_proto_distances": top_distances,
                 }
@@ -195,41 +235,6 @@ class PrototypeEDLHead(nn.Module):
         return warnings
 
 
-class BagEmbeddingPrototypeDSTModel(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        edl_dropout=0.0,
-        proto_k=4,
-        proto_topk=3,
-        proto_normalize=True,
-        proto_gamma_init=1.0,
-        proto_alpha_init=0.0,
-    ):
-        super().__init__()
-        self.is_training = True
-        self.edl_head = PrototypeEDLHead(
-            in_features=in_features,
-            num_classes=2,
-            prototypes_per_class=proto_k,
-            topk=proto_topk,
-            normalize=proto_normalize,
-            gamma_init=proto_gamma_init,
-            alpha_init=proto_alpha_init,
-            dropout=edl_dropout,
-        )
-
-    def forward(self, x, bag_mask=None):
-        if x.ndim == 3 and x.size(1) == 1:
-            x = x.squeeze(1)
-        out = self.edl_head(x)
-        out["type"] = "bag_embedding"
-        return out
-
-    def prototype_heads(self):
-        return {"edl_head": self.edl_head}
-
-
 class MIL_EDL_Prototype_Wrapper(MIL_EDL_Wrapper):
     def __init__(
         self,
@@ -241,15 +246,7 @@ class MIL_EDL_Prototype_Wrapper(MIL_EDL_Wrapper):
         proto_gamma_init=1.0,
         proto_alpha_init=0.0,
     ):
-        super().__init__(
-            mil_model,
-            edl_dropout=edl_dropout,
-            dst_k=proto_k,
-            dst_topk=proto_topk,
-            dst_normalize=proto_normalize,
-            dst_gamma_init=proto_gamma_init,
-            dst_alpha_init=proto_alpha_init,
-        )
+        super().__init__(mil_model, edl_dropout=edl_dropout)
 
         self.proto_k = int(proto_k)
         self.proto_topk = int(proto_topk)

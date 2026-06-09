@@ -5,6 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from .dst_layers import (
+    DempsterShaferModule,
+    DistanceActivationLayer,
+    dst_activation_init_alpha,
+    dst_activation_init_gamma,
+    pignistic,
+)
+
 
 class EDLHead(nn.Module):
     """
@@ -38,9 +46,156 @@ class EDLHead(nn.Module):
         }
 
 
+class DSTHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        num_classes=2,
+        prototypes_per_class=4,
+        topk=0,
+        normalize=True,
+        gamma_init=1.0,
+        alpha_init=0.0,
+        dropout=0.0,
+    ):
+        super().__init__()
+        if prototypes_per_class < 1:
+            raise ValueError("prototypes_per_class must be >= 1.")
+
+        self.in_features = int(in_features)
+        self.num_classes = int(num_classes)
+        self.prototypes_per_class = int(prototypes_per_class)
+        self.n_prototypes = self.num_classes * self.prototypes_per_class
+        self.topk = int(topk)
+        self.normalize = bool(normalize)
+        self.drop = nn.Dropout(p=dropout)
+
+        self.ds_module = DempsterShaferModule(
+            n_feature_maps=self.in_features,
+            n_classes=self.num_classes,
+            n_prototypes=self.n_prototypes,
+        )
+        self.ds_module.ds1_activate = DistanceActivationLayer(
+            n_prototypes=self.n_prototypes,
+            init_alpha=dst_activation_init_alpha(alpha_init),
+            init_gamma=dst_activation_init_gamma(gamma_init),
+        )
+        self.reset_parameters()
+
+    @property
+    def prototypes(self):
+        return self.ds_module.ds1.w.view(
+            self.num_classes,
+            self.prototypes_per_class,
+            self.in_features,
+        )
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.ds_module.ds1.w)
+
+    def forward(self, x):
+        x = self.drop(x.float())
+        mass, distances, similarity, mass_prototypes = self.ds_module(
+            x,
+            normalize=self.normalize,
+        )
+        prob, uncertainty = pignistic(mass, self.num_classes)
+
+        prototype_mass = torch.zeros(
+            x.shape[0],
+            self.num_classes,
+            self.prototypes_per_class,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        for class_idx in range(self.num_classes):
+            start = class_idx * self.prototypes_per_class
+            end = start + self.prototypes_per_class
+            prototype_mass[:, class_idx, :] = mass_prototypes[:, start:end, class_idx]
+
+        distances_by_class = distances.view(
+            x.shape[0],
+            self.num_classes,
+            self.prototypes_per_class,
+        )
+        similarity_by_class = similarity.view(
+            x.shape[0],
+            self.num_classes,
+            self.prototypes_per_class,
+        )
+
+        out = {
+            "prob": prob,
+            "uncertainty": uncertainty,
+            "dst_mass": mass,
+            "prototype_distances": distances_by_class,
+            "prototype_similarity": similarity_by_class,
+            "prototype_evidence": prototype_mass,
+            "prototype_mass": prototype_mass,
+        }
+
+        if self.topk > 0:
+            topk = min(self.topk, self.prototypes_per_class)
+            top_mass, top_idx = torch.topk(prototype_mass, k=topk, dim=-1)
+            top_similarity = torch.gather(similarity_by_class, dim=-1, index=top_idx)
+            top_distances = torch.gather(distances_by_class, dim=-1, index=top_idx)
+            out.update(
+                {
+                    "topk_proto_idx": top_idx,
+                    "topk_proto_evidence": top_mass,
+                    "topk_proto_mass": top_mass,
+                    "topk_proto_similarity": top_similarity,
+                    "topk_proto_distances": top_distances,
+                }
+            )
+
+        return out
+
+
+class BagEmbeddingDSTModel(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        edl_dropout=0.0,
+        dst_k=4,
+        dst_topk=0,
+        dst_normalize=True,
+        dst_gamma_init=1.0,
+        dst_alpha_init=0.0,
+    ):
+        super().__init__()
+        self.is_training = True
+        self.dst_head = DSTHead(
+            in_features=in_features,
+            num_classes=2,
+            prototypes_per_class=dst_k,
+            topk=dst_topk,
+            normalize=dst_normalize,
+            gamma_init=dst_gamma_init,
+            alpha_init=dst_alpha_init,
+            dropout=edl_dropout,
+        )
+
+    def forward(self, x, bag_mask=None):
+        if x.ndim == 3 and x.size(1) == 1:
+            x = x.squeeze(1)
+        out = self.dst_head(x)
+        out["type"] = "bag_embedding"
+        return out
+
+
 class MIL_EDL_Wrapper(nn.Module):
 
-    def __init__(self, mil_model, edl_dropout=0.0):
+    def __init__(
+        self,
+        mil_model,
+        edl_dropout=0.0,
+        dst_k=4,
+        dst_topk=0,
+        dst_normalize=True,
+        dst_gamma_init=1.0,
+        dst_alpha_init=0.0,
+    ):
         super(MIL_EDL_Wrapper, self).__init__()
         
         self.mil_model = mil_model
@@ -59,13 +214,31 @@ class MIL_EDL_Wrapper(nn.Module):
             in_features = self._get_classifier_in_features(mil_model.classifier)
             num_classes = mil_model.num_classes
      
-            self.edl_head = EDLHead(in_features, num_classes=2, dropout=edl_dropout)
+            self.edl_head = DSTHead(
+                in_features,
+                num_classes=2,
+                prototypes_per_class=dst_k,
+                topk=dst_topk,
+                normalize=dst_normalize,
+                gamma_init=dst_gamma_init,
+                alpha_init=dst_alpha_init,
+                dropout=edl_dropout,
+            )
       
         self.edl_side_heads = nn.ModuleDict()
         if hasattr(mil_model, 'side_classifiers'):
             for key, clf in mil_model.side_classifiers.items():
                 in_feat = self._get_classifier_in_features(clf)
-                self.edl_side_heads[key] = EDLHead(in_feat, num_classes=2, dropout=edl_dropout)
+                self.edl_side_heads[key] = DSTHead(
+                    in_feat,
+                    num_classes=2,
+                    prototypes_per_class=dst_k,
+                    topk=dst_topk,
+                    normalize=dst_normalize,
+                    gamma_init=dst_gamma_init,
+                    alpha_init=dst_alpha_init,
+                    dropout=edl_dropout,
+                )
     
     def _get_classifier_in_features(self, classifier_module):
   
@@ -213,26 +386,22 @@ class MIL_EDL_Wrapper(nn.Module):
                     f"EDL {self.type_scale_aggregator} aggregation requires scale-specific EDL heads."
                 )
 
-            evidences = torch.stack(
-                [side_edl_outputs[scale]['evidence'] for scale in self.scales],
+            masses = torch.stack(
+                [side_edl_outputs[scale]['dst_mass'] for scale in self.scales],
                 dim=1
             )
             if self.type_scale_aggregator == 'mean_p':
-                evidence = evidences.mean(dim=1)
+                mass = masses.mean(dim=1)
             else:
-                evidence = evidences.max(dim=1).values
+                mass = masses.max(dim=1).values
 
-            alpha = evidence + 1.0
-            S = torch.sum(alpha, dim=-1, keepdim=True)
-            prob = alpha / S
-            uncertainty = alpha.shape[-1] / S.squeeze(-1)
+            mass = mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            prob, uncertainty = pignistic(mass, 2)
 
             return {
-                'evidence': evidence,
-                'alpha': alpha,
-                'S': S,
                 'prob': prob,
                 'uncertainty': uncertainty,
+                'dst_mass': mass,
                 'type': 'multi_scale',
                 'side_outputs': side_edl_outputs,
             }

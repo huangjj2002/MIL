@@ -19,8 +19,7 @@ from tqdm import tqdm
 # Internal imports
 from Datasets.dataset_utils import MIL_dataloader
 from MIL import build_model
-from MIL.edl_models import EDLHead, MIL_EDL_Wrapper
-from MIL.edl_losses import EDLCombinedLoss
+from MIL.edl_models import BagEmbeddingDSTModel, MIL_EDL_Wrapper
 from utils.metrics import auroc, evaluate_metrics
 from utils.generic_utils import seed_all, clear_memory
 from utils.data_split_utils import (
@@ -32,19 +31,27 @@ from sklearn.metrics import confusion_matrix
 
 
 def config():
-    parser = argparse.ArgumentParser(description="EDL Test Script")
+    parser = argparse.ArgumentParser(description="DST Test Script")
     
     # ===== Checkpoint =====
     parser.add_argument('--checkpoint_dir', type=str, required=True,
-                        help='Path to EDL training output directory containing fold_0, fold_1, ... subdirs')
+                        help='Path to DST training output directory containing fold_0, fold_1, ... subdirs')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='Output directory for test results (default: checkpoint_dir/edl_test_results)')
+                        help='Output directory for test results (default: checkpoint_dir/dst_test_results)')
     
     # ===== EDL-specific =====
     parser.add_argument('--edl_kl_weight', type=float, default=0.1)
     parser.add_argument('--edl_annealing_epochs', type=int, default=10)
     parser.add_argument('--edl_annealing_start', type=int, default=0)
     parser.add_argument('--edl_dropout', type=float, default=0.0)
+    parser.add_argument('--dst_k', '--dst-k', dest='dst_k', default=4, type=int)
+    parser.add_argument('--dst_topk', '--dst-topk', dest='dst_topk', default=0, type=int)
+    parser.add_argument('--dst_gamma_init', '--dst-gamma-init', dest='dst_gamma_init',
+                        default=1.0, type=float)
+    parser.add_argument('--dst_alpha_init', '--dst-alpha-init', dest='dst_alpha_init',
+                        default=0.0, type=float)
+    parser.add_argument('--dst_normalize', '--dst-normalize', dest='dst_normalize',
+                        default='y', choices=['y', 'n'])
     parser.add_argument('--edl_focal_gamma', '--edl-focal-gamma', dest='edl_focal_gamma',
                         type=float, default=0.0)
     parser.add_argument('--edl_wrong_evidence_penalty_weight', '--edl-wrong-evidence-penalty-weight',
@@ -61,6 +68,8 @@ def config():
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument("--data_dir", default="datasets/Vindir-mammoclip", type=str)
     parser.add_argument("--csv_file", default="grouped_df.csv", type=str)
+    parser.add_argument('--embedding_cache_dir', '--embedding-cache-dir',
+                        dest='embedding_cache_dir', default=None, type=str)
     parser.add_argument("--img_dir", default="VinDir_preprocessed_mammoclip/images_png", type=str)
     parser.add_argument("--clip_chk_pt_path", default=None, type=str,
                         help="Path to Mammo-CLIP checkpoint; required when --feature_extraction online")
@@ -174,6 +183,18 @@ def _get_checkpoint_state_dict(checkpoint):
     return checkpoint
 
 
+def _infer_bag_embedding_dim(args):
+    if getattr(args, 'embedding_cache_dir', None) is None:
+        raise ValueError("--embedding_cache_dir is required when --feature_extraction bag_embedding.")
+    embeddings_path = Path(args.embedding_cache_dir) / "embeddings.npy"
+    if not embeddings_path.exists():
+        raise FileNotFoundError(f"Bag embeddings not found: {embeddings_path}")
+    embeddings = np.load(embeddings_path, mmap_mode='r')
+    if embeddings.ndim != 2:
+        raise ValueError(f"Expected embeddings.npy to be 2D, got shape {embeddings.shape}.")
+    return int(embeddings.shape[1])
+
+
 def _print_load_summary(prefix, load_msg):
     missing = list(getattr(load_msg, 'missing_keys', []))
     unexpected = list(getattr(load_msg, 'unexpected_keys', []))
@@ -185,7 +206,7 @@ def _print_load_summary(prefix, load_msg):
 
 
 def build_edl_model(args, checkpoint_path=None):
-    """Build and load EDL model."""
+    """Build and load DST model."""
     args.n_class = 1
     if args.feature_extraction == 'online' and not getattr(args, 'clip_chk_pt_path', None):
         raise ValueError(
@@ -193,14 +214,33 @@ def build_edl_model(args, checkpoint_path=None):
             "so the Mammo-CLIP image encoder/backbone can be initialized."
         )
 
-    mil_model = build_model(args)
-    edl_model = MIL_EDL_Wrapper(mil_model, edl_dropout=args.edl_dropout)
+    if args.feature_extraction == 'bag_embedding':
+        edl_model = BagEmbeddingDSTModel(
+            in_features=_infer_bag_embedding_dim(args),
+            edl_dropout=args.edl_dropout,
+            dst_k=args.dst_k,
+            dst_topk=args.dst_topk,
+            dst_normalize=args.dst_normalize,
+            dst_gamma_init=args.dst_gamma_init,
+            dst_alpha_init=args.dst_alpha_init,
+        )
+    else:
+        mil_model = build_model(args)
+        edl_model = MIL_EDL_Wrapper(
+            mil_model,
+            edl_dropout=args.edl_dropout,
+            dst_k=args.dst_k,
+            dst_topk=args.dst_topk,
+            dst_normalize=args.dst_normalize,
+            dst_gamma_init=args.dst_gamma_init,
+            dst_alpha_init=args.dst_alpha_init,
+        )
     
     if checkpoint_path is not None:
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         load_msg = edl_model.load_state_dict(_get_checkpoint_state_dict(checkpoint), strict=False)
-        print(f"[EDL Test] Loaded EDL model from: {checkpoint_path}")
-        _print_load_summary("[EDL Test][load]", load_msg)
+        print(f"[DST Test] Loaded DST model from: {checkpoint_path}")
+        _print_load_summary("[DST Test][load]", load_msg)
     
     return edl_model
 
@@ -208,7 +248,7 @@ def build_edl_model(args, checkpoint_path=None):
 @torch.no_grad()
 def edl_predict(loader, model, args, device):
     """
-    Run EDL inference on a data loader.
+    Run DST inference on a data loader.
     
     Returns:
         dict with sample-level predictions
@@ -220,13 +260,12 @@ def edl_predict(loader, model, args, device):
     probs_list = []
     preds_list = []
     uncertainty_list = []
-    evidence_list = []
-    alpha_list = []
+    mass_list = []
     
     sample_patient_ids = []
     sample_image_ids = []
     
-    progress_iter = tqdm(enumerate(loader), total=len(loader), desc="EDL predict")
+    progress_iter = tqdm(enumerate(loader), total=len(loader), desc="DST predict")
     
     for step, data in progress_iter:
         if isinstance(data['x'], dict):
@@ -248,8 +287,7 @@ def edl_predict(loader, model, args, device):
             edl_out = model(inputs)
         
         prob = edl_out['prob'].detach().cpu()
-        evidence = edl_out['evidence'].detach().cpu()
-        alpha = edl_out['alpha'].detach().cpu()
+        mass = edl_out['dst_mass'].detach().cpu()
         uncertainty = edl_out['uncertainty'].detach().cpu()
         pred_class = torch.argmax(prob, dim=-1)
         
@@ -257,8 +295,7 @@ def edl_predict(loader, model, args, device):
         probs_list.append(prob[:, 1].numpy())  # positive class prob
         preds_list.append(pred_class.numpy())
         uncertainty_list.append(uncertainty.numpy())
-        evidence_list.append(evidence.numpy())
-        alpha_list.append(alpha.numpy())
+        mass_list.append(mass.numpy())
     
     results = {
         'patient_id': sample_patient_ids,
@@ -267,10 +304,9 @@ def edl_predict(loader, model, args, device):
         'score': np.concatenate(probs_list).tolist(),
         'pred': np.concatenate(preds_list).tolist(),
         'uncertainty': np.concatenate(uncertainty_list).tolist(),
-        'evidence_0': np.concatenate(evidence_list)[:, 0].tolist(),
-        'evidence_1': np.concatenate(evidence_list)[:, 1].tolist(),
-        'alpha_0': np.concatenate(alpha_list)[:, 0].tolist(),
-        'alpha_1': np.concatenate(alpha_list)[:, 1].tolist(),
+        'mass_0': np.concatenate(mass_list)[:, 0].tolist(),
+        'mass_1': np.concatenate(mass_list)[:, 1].tolist(),
+        'mass_omega': np.concatenate(mass_list)[:, 2].tolist(),
     }
     
     return results
@@ -278,7 +314,7 @@ def edl_predict(loader, model, args, device):
 
 def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
     """
-    EDL test function that can be called from training script or standalone.
+    DST test function that can be called from training script or standalone.
     
     Args:
         args: configuration namespace
@@ -302,7 +338,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
     elif hasattr(args, 'output_dir') and args.output_dir is not None:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = checkpoint_dir / 'edl_test_results'
+        output_dir = checkpoint_dir / 'dst_test_results'
     output_dir.mkdir(parents=True, exist_ok=True)
     seed_all(args.seed)
     
@@ -328,7 +364,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
 
     # Prefer the fold assignment produced by training. If absent, recreate the
     # same split path after resetting the seed.
-    assignment_path = checkpoint_dir / f'{args.dataset}_edl_val_fold_assignments.csv'
+    assignment_path = checkpoint_dir / f'{args.dataset}_dst_val_fold_assignments.csv'
     fold_val_dfs = {}
     if assignment_path.exists():
         assignment_df = pd.read_csv(assignment_path)
@@ -341,7 +377,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
                 val_frac=args.kfold0_val_frac,
                 max_val_frac=args.kfold0_val_max_frac,
                 args=args,
-                context="EDL test n_folds=0 internal train/val split",
+                context="DST test n_folds=0 internal train/val split",
             )
             fold_val_dfs[0] = val_df_fold.reset_index(drop=True)
         else:
@@ -387,10 +423,9 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
             label_col: val_results['label'],
             'prediction_score': val_results['score'],
             'predicted_class': val_results['pred'],
-            'evidence_0': val_results['evidence_0'],
-            'evidence_1': val_results['evidence_1'],
-            'alpha_0': val_results['alpha_0'],
-            'alpha_1': val_results['alpha_1'],
+            'mass_0': val_results['mass_0'],
+            'mass_1': val_results['mass_1'],
+            'mass_omega': val_results['mass_omega'],
             'uncertainty': val_results['uncertainty'],
             'fold': fold,
         })
@@ -417,7 +452,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
     
     if all_dev_results:
         dev_results_df = pd.concat(all_dev_results, ignore_index=True)
-        dev_results_df.to_csv(output_dir / f'{args.dataset}_edl_dev_predictions.csv', index=False)
+        dev_results_df.to_csv(output_dir / f'{args.dataset}_dst_dev_predictions.csv', index=False)
         print(f"\nDev predictions saved: {len(dev_results_df)} samples")
     
     # ========== Predict on test data ==========
@@ -447,10 +482,9 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
                 label_col: test_results['label'],
                 'prediction_score': test_results['score'],
                 'predicted_class': test_results['pred'],
-                'evidence_0': test_results['evidence_0'],
-                'evidence_1': test_results['evidence_1'],
-                'alpha_0': test_results['alpha_0'],
-                'alpha_1': test_results['alpha_1'],
+                'mass_0': test_results['mass_0'],
+                'mass_1': test_results['mass_1'],
+                'mass_omega': test_results['mass_omega'],
                 'uncertainty': test_results['uncertainty'],
                 'fold': fold,
             })
@@ -477,15 +511,14 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
         
         if test_all_fold_results:
             test_all_df = pd.concat(test_all_fold_results, ignore_index=True)
-            test_all_df.to_csv(output_dir / f'{args.dataset}_edl_test_all_folds.csv', index=False)
+            test_all_df.to_csv(output_dir / f'{args.dataset}_dst_test_all_folds.csv', index=False)
             
             test_ensemble = test_all_df.groupby(['patient_id', 'image_id']).agg({
                 'prediction_score': 'mean',
                 'predicted_class': lambda x: (x.mean() >= 0.5).astype(int),
-                'evidence_0': 'mean',
-                'evidence_1': 'mean',
-                'alpha_0': 'mean',
-                'alpha_1': 'mean',
+                'mass_0': 'mean',
+                'mass_1': 'mean',
+                'mass_omega': 'mean',
                 'uncertainty': 'mean',
                 label_col: 'first',
                 'cohort_num': 'first',
@@ -493,7 +526,7 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
             }).reset_index()
             test_ensemble['fold'] = 'ensemble'
             
-            test_ensemble.to_csv(output_dir / f'{args.dataset}_edl_test_ensemble.csv', index=False)
+            test_ensemble.to_csv(output_dir / f'{args.dataset}_dst_test_ensemble.csv', index=False)
             
             targs_ens = test_ensemble[label_col].values
             probs_ens = test_ensemble['prediction_score'].values.astype(float)
@@ -515,15 +548,16 @@ def run_edl_test(args, device, checkpoint_dir=None, output_dir=None):
         combined_df = None
     
     if combined_df is not None:
-        combined_df.to_csv(output_dir / f'{args.dataset}_edl_all_predictions.csv', index=False)
-        print(f"\nCombined predictions saved: {len(combined_df)} samples -> {output_dir / f'{args.dataset}_edl_all_predictions.csv'}")
+        combined_df.to_csv(output_dir / f'{args.dataset}_dst_all_predictions.csv', index=False)
+        print(f"\nCombined predictions saved: {len(combined_df)} samples -> {output_dir / f'{args.dataset}_dst_all_predictions.csv'}")
     
-    print("\n===== EDL Test Complete =====")
+    print("\n===== DST Test Complete =====")
     return output_dir
 
 
 def main():
     args = config()
+    args.dst_normalize = args.dst_normalize == "y"
     
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     print(f"[INFO] Using GPU {args.gpu_id}")
