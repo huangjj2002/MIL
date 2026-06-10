@@ -757,8 +757,7 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         )
         annealing_complete = annealing_coeff >= 1.0
         should_save = (
-            (val_auc_is_valid and val_auc > best_aucroc + early_stop_min_delta)
-            or (not val_auc_is_valid and val_stats['loss'] < best_val_loss - early_stop_min_delta)
+            val_stats['loss'] < best_val_loss - early_stop_min_delta
             or best_val_stats is None
         )
 
@@ -771,10 +770,10 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
             best_epoch = epoch + 1
             
             best_checkpoint_path = output_path / 'best_model.pth'
-            if val_auc_is_valid:
-                print(f'Epoch {epoch + 1} - Save best AUC: {best_aucroc:.4f}')
-            else:
-                print(f"Epoch {epoch + 1} - {valid_display_name} AUC is undefined; save best validation loss: {best_val_loss:.4f}")
+            print(
+                f"Epoch {epoch + 1} - Save best validation loss: {best_val_loss:.4f} "
+                f"(AUC: {val_stats['auc_roc']:.4f})"
+            )
             
             torch.save({
                 'model': model.state_dict(),
@@ -789,10 +788,7 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         else:
             epochs_without_improvement += 1
         
-        if np.isfinite(best_aucroc):
-            print(f'\nBest AUC-ROC at epoch {best_epoch}: {best_aucroc:.4f}')
-        else:
-            print(f'\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f} (AUC undefined)')
+        print(f'\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f}')
 
         if early_stop_patience > 0:
             if not annealing_complete:

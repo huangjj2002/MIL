@@ -447,6 +447,40 @@ def edl_proto_train_fn(train_loader, model, criterion, optimizer, epoch, args, s
     return train_stats
 
 
+@torch.no_grad()
+def evaluate_proto_regularization(loader, model, args, device, desc="DST_PROTO val proto-reg"):
+    model.eval()
+    model.is_training = False
+
+    proto_losses = AverageMeter()
+    proto_attract_losses = AverageMeter()
+    proto_separation_losses = AverageMeter()
+    proto_diversity_losses = AverageMeter()
+
+    progress_iter = tqdm(enumerate(loader), desc=desc, total=len(loader))
+    for _, data in progress_iter:
+        inputs = _move_inputs_to_device(data, device, non_blocking=True)
+        labels = data["y"].long().to(device)
+        batch_size = labels.size(0)
+
+        amp_enabled = bool(args.apex) and device.type == "cuda"
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            edl_out = model(inputs)
+            proto_reg, proto_dict = prototype_regularization_loss(model, edl_out, labels, args)
+
+        proto_losses.update(float(proto_dict["proto_reg"].item()), batch_size)
+        proto_attract_losses.update(float(proto_dict["proto_attract"].item()), batch_size)
+        proto_separation_losses.update(float(proto_dict["proto_separate"].item()), batch_size)
+        proto_diversity_losses.update(float(proto_dict["proto_diverse"].item()), batch_size)
+
+    return {
+        "proto_reg_loss": proto_losses.avg,
+        "proto_attract_loss": proto_attract_losses.avg,
+        "proto_separation_loss": proto_separation_losses.avg,
+        "proto_diversity_loss": proto_diversity_losses.avg,
+    }
+
+
 def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
                          criterion, output_path, args, device, valid_split_name="val"):
 
@@ -468,6 +502,7 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         "proto_diversity_loss",
     ]:
         train_results[key] = []
+        val_results[key] = []
 
     for epoch in range(args.epochs):
         print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
@@ -479,6 +514,15 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         _, _, _, val_stats, _ = edl_valid_fn(
             valid_loader, model, args, device, split=valid_split_name, epoch=epoch
         )
+        val_proto_stats = evaluate_proto_regularization(
+            valid_loader,
+            model,
+            args,
+            device,
+            desc=f"[{epoch + 1:03d}/{args.epochs:03d} DST_PROTO val proto-reg]",
+        )
+        val_stats.update(val_proto_stats)
+        val_stats["loss"] = val_stats["loss"] + val_proto_stats["proto_reg_loss"]
 
         _ = time.time() - start_time
         valid_display_name = "Test" if valid_split_name == "test" else "Val"
@@ -490,6 +534,7 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         )
         print(
             f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | "
+            f"ProtoReg: {val_stats['proto_reg_loss']:.4f} | "
             f"F1: {val_stats['f1']:.4f} | BAcc: {val_stats['bacc']:.4f} | "
             f"AUC: {val_stats['auc_roc']:.4f}"
         )
@@ -507,8 +552,7 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         )
         annealing_complete = annealing_coeff >= 1.0
         should_save = (
-            (val_auc_is_valid and val_auc > best_aucroc + early_stop_min_delta)
-            or (not val_auc_is_valid and val_stats["loss"] < best_val_loss - early_stop_min_delta)
+            val_stats["loss"] < best_val_loss - early_stop_min_delta
             or best_val_stats is None
         )
 
@@ -520,13 +564,10 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
             best_val_stats = val_stats
             best_epoch = epoch + 1
             best_checkpoint_path = output_path / "best_model.pth"
-            if val_auc_is_valid:
-                print(f"Epoch {epoch + 1} - Save best AUC: {best_aucroc:.4f}")
-            else:
-                print(
-                    f"Epoch {epoch + 1} - {valid_display_name} AUC is undefined; "
-                    f"save best validation loss: {best_val_loss:.4f}"
-                )
+            print(
+                f"Epoch {epoch + 1} - Save best validation loss: {best_val_loss:.4f} "
+                f"(AUC: {val_stats['auc_roc']:.4f})"
+            )
             torch.save({
                 "model": model.state_dict(),
                 "epoch": epoch,
@@ -540,10 +581,7 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         else:
             epochs_without_improvement += 1
 
-        if np.isfinite(best_aucroc):
-            print(f"\nBest AUC-ROC at epoch {best_epoch}: {best_aucroc:.4f}")
-        else:
-            print(f"\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f} (AUC undefined)")
+        print(f"\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f}")
 
         if early_stop_patience > 0:
             if not annealing_complete:
@@ -919,6 +957,14 @@ def do_edl_proto_training(args, device):
             "eval_source": "internal_val" if single_internal_val else "cross_val",
         }
         for key in EDL_LOSS_DIAGNOSTIC_KEYS:
+            if key in val_stats:
+                fold_summary[key] = val_stats[key]
+        for key in [
+            "proto_reg_loss",
+            "proto_attract_loss",
+            "proto_separation_loss",
+            "proto_diversity_loss",
+        ]:
             if key in val_stats:
                 fold_summary[key] = val_stats[key]
         all_val_results.append(fold_summary)

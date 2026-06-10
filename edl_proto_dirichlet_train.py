@@ -420,6 +420,10 @@ def edl_proto_dirichlet_valid_fn(valid_loader, model, args, device, split="val",
     losses = AverageMeter()
     criterion_eval = build_dirichlet_criterion(args, class_weights=None)
     loss_meters = _new_loss_meters()
+    proto_losses = AverageMeter()
+    proto_attract_losses = AverageMeter()
+    proto_separation_losses = AverageMeter()
+    proto_diversity_losses = AverageMeter()
 
     targs = []
     probs_list = []
@@ -453,9 +457,15 @@ def edl_proto_dirichlet_valid_fn(valid_loader, model, args, device, split="val",
             for side_out in edl_out.get("side_outputs", {}).values():
                 side_loss, _ = criterion_eval(side_out, labels, epoch=epoch)
                 loss = loss + side_loss
+            proto_reg, proto_dict = prototype_regularization_loss(model, edl_out, labels, args)
+            loss = loss + proto_reg
 
         losses.update(loss.item(), batch_size)
         _update_loss_meters(loss_meters, loss_dict, batch_size)
+        proto_losses.update(float(proto_dict["proto_reg"].item()), batch_size)
+        proto_attract_losses.update(float(proto_dict["proto_attract"].item()), batch_size)
+        proto_separation_losses.update(float(proto_dict["proto_separate"].item()), batch_size)
+        proto_diversity_losses.update(float(proto_dict["proto_diverse"].item()), batch_size)
 
         prob = edl_out["prob"].detach()
         pred_class = torch.argmax(prob, dim=-1)
@@ -487,6 +497,10 @@ def edl_proto_dirichlet_valid_fn(valid_loader, model, args, device, split="val",
         "evidence_1_mean": float(evidence_array[:, 1].mean()),
         "alpha_0_mean": float(alpha_array[:, 0].mean()),
         "alpha_1_mean": float(alpha_array[:, 1].mean()),
+        "proto_reg_loss": proto_losses.avg,
+        "proto_attract_loss": proto_attract_losses.avg,
+        "proto_separation_loss": proto_separation_losses.avg,
+        "proto_diversity_loss": proto_diversity_losses.avg,
     }
     stats.update(_loss_meter_averages(loss_meters))
 
@@ -526,6 +540,7 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
         "proto_diversity_loss",
     ]:
         train_results[key] = []
+        val_results[key] = []
 
     for epoch in range(args.epochs):
         print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
@@ -547,6 +562,7 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
         )
         print(
             f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | "
+            f"ProtoReg: {val_stats['proto_reg_loss']:.4f} | "
             f"F1: {val_stats['f1']:.4f} | BAcc: {val_stats['bacc']:.4f} | "
             f"AUC: {val_stats['auc_roc']:.4f}"
         )
@@ -560,8 +576,7 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
         annealing_coeff = criterion.get_annealing_coeff(epoch)
         annealing_complete = annealing_coeff >= 1.0
         should_save = (
-            (val_auc_is_valid and val_auc > best_aucroc + early_stop_min_delta)
-            or (not val_auc_is_valid and val_stats["loss"] < best_val_loss - early_stop_min_delta)
+            val_stats["loss"] < best_val_loss - early_stop_min_delta
             or best_val_stats is None
         )
 
@@ -573,13 +588,10 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
             best_val_stats = val_stats
             best_epoch = epoch + 1
             best_checkpoint_path = output_path / "best_model.pth"
-            if val_auc_is_valid:
-                print(f"Epoch {epoch + 1} - Save best AUC: {best_aucroc:.4f}")
-            else:
-                print(
-                    f"Epoch {epoch + 1} - {valid_display_name} AUC is undefined; "
-                    f"save best validation loss: {best_val_loss:.4f}"
-                )
+            print(
+                f"Epoch {epoch + 1} - Save best validation loss: {best_val_loss:.4f} "
+                f"(AUC: {val_stats['auc_roc']:.4f})"
+            )
             torch.save({
                 "model": model.state_dict(),
                 "epoch": epoch,
@@ -593,10 +605,7 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
         else:
             epochs_without_improvement += 1
 
-        if np.isfinite(best_aucroc):
-            print(f"\nBest AUC-ROC at epoch {best_epoch}: {best_aucroc:.4f}")
-        else:
-            print(f"\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f} (AUC undefined)")
+        print(f"\nBest validation loss at epoch {best_epoch}: {best_val_loss:.4f}")
 
         if early_stop_patience > 0:
             if not annealing_complete:
@@ -1204,6 +1213,14 @@ def do_edl_proto_dirichlet_training(args, device):
             "eval_source": "internal_val" if single_internal_val else "cross_val",
         }
         for key in DIRICHLET_DIAGNOSTIC_KEYS:
+            if key in val_stats:
+                fold_summary[key] = val_stats[key]
+        for key in [
+            "proto_reg_loss",
+            "proto_attract_loss",
+            "proto_separation_loss",
+            "proto_diversity_loss",
+        ]:
             if key in val_stats:
                 fold_summary[key] = val_stats[key]
         for key in ["evidence_0_mean", "evidence_1_mean", "alpha_0_mean", "alpha_1_mean"]:
