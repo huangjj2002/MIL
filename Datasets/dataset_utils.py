@@ -365,7 +365,7 @@ def MIL_dataloader(split_df, split, args):
             shuffle=split == "train",
             num_workers=args.num_workers,
             pin_memory=True,
-            drop_last=split == "train",
+            drop_last=False,
             collate_fn=collate_bag_embeddings,
         )
 
