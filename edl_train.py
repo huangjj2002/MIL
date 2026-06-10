@@ -554,14 +554,15 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
 
 
 @torch.no_grad()
-def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1):
+def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1, criterion_eval=None):
  
     
     model.eval()
     model.is_training = False
     
     losses = AverageMeter()
-    criterion_eval = build_edl_criterion(args, class_weights=None)
+    if criterion_eval is None:
+        criterion_eval = build_edl_criterion(args, class_weights=None)
     loss_meters = _new_loss_meters()
     
     targs = []
@@ -735,7 +736,14 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         
      
         val_targs, val_preds, val_probs, val_stats, _ = edl_valid_fn(
-            valid_loader, model, args, device, split=valid_split_name, epoch=epoch)
+            valid_loader,
+            model,
+            args,
+            device,
+            split=valid_split_name,
+            epoch=epoch,
+            criterion_eval=criterion,
+        )
         
         elapsed = time.time() - start_time
         

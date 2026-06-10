@@ -413,12 +413,21 @@ def edl_proto_dirichlet_train_fn(train_loader, model, criterion, optimizer, epoc
 
 
 @torch.no_grad()
-def edl_proto_dirichlet_valid_fn(valid_loader, model, args, device, split="val", epoch=1):
+def edl_proto_dirichlet_valid_fn(
+    valid_loader,
+    model,
+    args,
+    device,
+    split="val",
+    epoch=1,
+    criterion_eval=None,
+):
     model.eval()
     model.is_training = False
 
     losses = AverageMeter()
-    criterion_eval = build_dirichlet_criterion(args, class_weights=None)
+    if criterion_eval is None:
+        criterion_eval = build_dirichlet_criterion(args, class_weights=None)
     loss_meters = _new_loss_meters()
     proto_losses = AverageMeter()
     proto_attract_losses = AverageMeter()
@@ -550,7 +559,13 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device
         )
         _, _, _, val_stats, _ = edl_proto_dirichlet_valid_fn(
-            valid_loader, model, args, device, split=valid_split_name, epoch=epoch
+            valid_loader,
+            model,
+            args,
+            device,
+            split=valid_split_name,
+            epoch=epoch,
+            criterion_eval=criterion,
         )
 
         valid_display_name = "Test" if valid_split_name == "test" else "Val"

@@ -512,7 +512,13 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device
         )
         _, _, _, val_stats, _ = edl_valid_fn(
-            valid_loader, model, args, device, split=valid_split_name, epoch=epoch
+            valid_loader,
+            model,
+            args,
+            device,
+            split=valid_split_name,
+            epoch=epoch,
+            criterion_eval=criterion,
         )
         val_proto_stats = evaluate_proto_regularization(
             valid_loader,
