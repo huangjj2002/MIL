@@ -451,6 +451,27 @@ def _init_epoch_history(include_lr=False):
     return history
 
 
+def use_train_eval_metrics(args):
+    return getattr(args, 'feature_extraction', None) == 'bag_embedding'
+
+
+def build_train_eval_loader(train_df, args):
+    if not use_train_eval_metrics(args):
+        return None
+    return MIL_dataloader(train_df, 'test', args)
+
+
+def get_train_curve_metadata(train_eval_loader=None):
+    if train_eval_loader is not None:
+        return 'train_eval', 'Train Eval'
+    return 'train', 'Train'
+
+
+def format_fold_label(output_path):
+    fold_name = Path(output_path).name.replace('_', ' ')
+    return fold_name
+
+
 def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device):
 
     
@@ -648,7 +669,7 @@ def edl_valid_fn(valid_loader, model, args, device, split='val', epoch=1, criter
     return targs, preds, probs, val_stats, sample_results
 
 
-def save_loss_curve(train_results, val_results, output_path):
+def save_loss_curve(train_results, val_results, output_path, train_prefix='train', train_label='Train', plot_title='DST Loss Curve'):
 
     if not train_results['loss'] or not val_results['loss']:
         return
@@ -657,20 +678,20 @@ def save_loss_curve(train_results, val_results, output_path):
     n_epochs = len(train_results['loss'])
     curve_data = {
         'epoch': np.arange(1, len(train_results['loss']) + 1),
-        'train_loss': train_results['loss'],
+        f'{train_prefix}_loss': train_results['loss'],
         'val_loss': val_results['loss'],
-        'train_auc_roc': train_results['auc_roc'],
+        f'{train_prefix}_auc_roc': train_results['auc_roc'],
         'val_auc_roc': val_results['auc_roc'],
-        'train_f1': train_results['f1'],
+        f'{train_prefix}_f1': train_results['f1'],
         'val_f1': val_results['f1'],
-        'train_bacc': train_results['bacc'],
+        f'{train_prefix}_bacc': train_results['bacc'],
         'val_bacc': val_results['bacc'],
         'lr': train_results['lr'],
     }
     base_keys = {'loss', 'auc_roc', 'f1', 'bacc', 'lr'}
     for key, values in train_results.items():
         if key not in base_keys and len(values) == n_epochs:
-            curve_data[f'train_{key}'] = values
+            curve_data[f'{train_prefix}_{key}'] = values
     for key, values in val_results.items():
         if key not in base_keys and len(values) == n_epochs:
             curve_data[f'val_{key}'] = values
@@ -682,14 +703,26 @@ def save_loss_curve(train_results, val_results, output_path):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(curve_df['epoch'], curve_df['train_loss'], marker='o', label='Train Loss')
-        ax.plot(curve_df['epoch'], curve_df['val_loss'], marker='o', label='Val Loss')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.set_title('DST Loss Curve')
+        fig, ax = plt.subplots(figsize=(10, 5.75))
+        ax.plot(
+            curve_df['epoch'],
+            curve_df[f'{train_prefix}_loss'],
+            color='#1f77b4',
+            linewidth=2.2,
+            label=f'{train_label.lower()} loss',
+        )
+        ax.plot(
+            curve_df['epoch'],
+            curve_df['val_loss'],
+            color='#d62728',
+            linewidth=2.2,
+            label='val loss',
+        )
+        ax.set_xlabel('epoch')
+        ax.set_ylabel('loss')
+        ax.set_title(plot_title)
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.legend(loc='upper right', frameon=False)
         fig.tight_layout()
         fig.savefig(output_path / 'dst_loss_curve.png', dpi=200)
         plt.close(fig)
@@ -711,8 +744,9 @@ def get_edl_class_weights(train_df, label_col):
     return [1.0, pos_weight]
 
 
-def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler, 
-                   criterion, output_path, args, device, valid_split_name='val'):
+def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
+                   criterion, output_path, args, device, valid_split_name='val',
+                   train_eval_loader=None):
  
     
     best_aucroc = -float('inf')
@@ -726,6 +760,7 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
     
     train_results = _init_epoch_history(include_lr=True)
     val_results = _init_epoch_history(include_lr=False)
+    train_prefix, train_label = get_train_curve_metadata(train_eval_loader)
     
     for epoch in range(args.epochs):
         print(f"\n-------- Epoch {epoch + 1}/{args.epochs} --------")
@@ -733,6 +768,18 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         
         
         train_stats = edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device)
+        curve_train_stats = train_stats
+        if train_eval_loader is not None:
+            _, _, _, curve_train_stats, _ = edl_valid_fn(
+                train_eval_loader,
+                model,
+                args,
+                device,
+                split='train_eval',
+                epoch=epoch,
+                criterion_eval=criterion,
+            )
+            curve_train_stats['lr'] = train_stats['lr']
         
      
         val_targs, val_preds, val_probs, val_stats, _ = edl_valid_fn(
@@ -748,12 +795,20 @@ def edl_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scal
         elapsed = time.time() - start_time
         
         valid_display_name = 'Test' if valid_split_name == 'test' else 'Val'
-        print(f"\nTrain Loss: {train_stats['loss']:.4f} | F1: {train_stats['f1']:.4f} | BAcc: {train_stats['bacc']:.4f} | AUC: {train_stats['auc_roc']:.4f}")
+        print(f"\n{train_label} Loss: {curve_train_stats['loss']:.4f} | F1: {curve_train_stats['f1']:.4f} | BAcc: {curve_train_stats['bacc']:.4f} | AUC: {curve_train_stats['auc_roc']:.4f}")
         print(f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | F1: {val_stats['f1']:.4f} | BAcc: {val_stats['bacc']:.4f} | AUC: {val_stats['auc_roc']:.4f}")
         
-        _append_epoch_stats(train_results, train_stats)
+        _append_epoch_stats(train_results, curve_train_stats)
         _append_epoch_stats(val_results, val_stats)
-        save_loss_curve(train_results, val_results, output_path)
+        plot_title = f"DST k={getattr(args, 'dst_k', 0)} - {format_fold_label(output_path)}"
+        save_loss_curve(
+            train_results,
+            val_results,
+            output_path,
+            train_prefix=train_prefix,
+            train_label=train_label,
+            plot_title=plot_title,
+        )
         
   
         val_auc = val_stats['auc_roc']
@@ -907,6 +962,7 @@ def do_edl_training(args, device):
         print(f"Train: {len(train_df)}, {valid_split_name.capitalize()}: {len(val_df)}")
 
         train_loader = MIL_dataloader(train_df, 'train', args)
+        train_eval_loader = build_train_eval_loader(train_df, args)
         valid_loader = MIL_dataloader(val_df, valid_split_name, args)
         
        
@@ -957,7 +1013,9 @@ def do_edl_training(args, device):
      
         val_stats, best_checkpoint_path = edl_train_loop(
             train_loader, valid_loader, model, optimizer, scheduler, scaler,
-            criterion, path_results_fold, args, device, valid_split_name=valid_split_name
+            criterion, path_results_fold, args, device,
+            valid_split_name=valid_split_name,
+            train_eval_loader=train_eval_loader,
         )
 
         fold_summary = {

@@ -29,8 +29,11 @@ from edl_train import (
     _get_checkpoint_state_dict,
     _infer_bag_embedding_dim,
     _print_load_summary,
+    build_train_eval_loader,
     config as base_edl_config,
+    format_fold_label,
     freeze_mil_backbone_train_edl_only,
+    get_train_curve_metadata,
     resolve_mil_checkpoint,
 )
 from edl_proto_train import (
@@ -184,24 +187,24 @@ def _init_epoch_history(include_lr=False):
     return history
 
 
-def save_dirichlet_loss_curve(train_results, val_results, output_path):
+def save_dirichlet_loss_curve(train_results, val_results, output_path, train_prefix="train", train_label="Train", plot_title="Prototype-EDL Loss Curve"):
     n_epochs = len(train_results["loss"])
     curve_data = {
         "epoch": list(range(1, n_epochs + 1)),
-        "train_loss": train_results["loss"],
+        f"{train_prefix}_loss": train_results["loss"],
         "val_loss": val_results["loss"],
-        "train_auc_roc": train_results["auc_roc"],
+        f"{train_prefix}_auc_roc": train_results["auc_roc"],
         "val_auc_roc": val_results["auc_roc"],
-        "train_f1": train_results["f1"],
+        f"{train_prefix}_f1": train_results["f1"],
         "val_f1": val_results["f1"],
-        "train_bacc": train_results["bacc"],
+        f"{train_prefix}_bacc": train_results["bacc"],
         "val_bacc": val_results["bacc"],
         "lr": train_results["lr"],
     }
     base_keys = {"loss", "auc_roc", "f1", "bacc", "lr"}
     for key, values in train_results.items():
         if key not in base_keys and len(values) == n_epochs:
-            curve_data[f"train_{key}"] = values
+            curve_data[f"{train_prefix}_{key}"] = values
     for key, values in val_results.items():
         if key not in base_keys and len(values) == n_epochs:
             curve_data[f"val_{key}"] = values
@@ -214,14 +217,26 @@ def save_dirichlet_loss_curve(train_results, val_results, output_path):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(curve_df["epoch"], curve_df["train_loss"], marker="o", label="Train Loss")
-        ax.plot(curve_df["epoch"], curve_df["val_loss"], marker="o", label="Val Loss")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss")
-        ax.set_title("Prototype-EDL Loss Curve")
+        fig, ax = plt.subplots(figsize=(10, 5.75))
+        ax.plot(
+            curve_df["epoch"],
+            curve_df[f"{train_prefix}_loss"],
+            color="#1f77b4",
+            linewidth=2.2,
+            label=f"{train_label.lower()} loss",
+        )
+        ax.plot(
+            curve_df["epoch"],
+            curve_df["val_loss"],
+            color="#d62728",
+            linewidth=2.2,
+            label="val loss",
+        )
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("loss")
+        ax.set_title(plot_title)
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.legend(loc="upper right", frameon=False)
         fig.tight_layout()
         fig.savefig(output_path / "edl_proto_loss_curve.png", dpi=200)
         plt.close(fig)
@@ -530,7 +545,8 @@ def edl_proto_dirichlet_valid_fn(
 
 
 def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
-                                   criterion, output_path, args, device, valid_split_name="val"):
+                                   criterion, output_path, args, device, valid_split_name="val",
+                                   train_eval_loader=None):
     best_aucroc = -float("inf")
     best_val_loss = float("inf")
     best_epoch = 0
@@ -542,6 +558,7 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
 
     train_results = _init_epoch_history(include_lr=True)
     val_results = _init_epoch_history(include_lr=False)
+    train_prefix, train_label = get_train_curve_metadata(train_eval_loader)
     for key in [
         "proto_reg_loss",
         "proto_attract_loss",
@@ -558,6 +575,18 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
         train_stats = edl_proto_dirichlet_train_fn(
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device
         )
+        curve_train_stats = train_stats
+        if train_eval_loader is not None:
+            _, _, _, curve_train_stats, _ = edl_proto_dirichlet_valid_fn(
+                train_eval_loader,
+                model,
+                args,
+                device,
+                split="train_eval",
+                epoch=epoch,
+                criterion_eval=criterion,
+            )
+            curve_train_stats["lr"] = train_stats["lr"]
         _, _, _, val_stats, _ = edl_proto_dirichlet_valid_fn(
             valid_loader,
             model,
@@ -570,10 +599,10 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
 
         valid_display_name = "Test" if valid_split_name == "test" else "Val"
         print(
-            f"\nTrain Loss: {train_stats['loss']:.4f} | "
-            f"ProtoReg: {train_stats['proto_reg_loss']:.4f} | "
-            f"F1: {train_stats['f1']:.4f} | BAcc: {train_stats['bacc']:.4f} | "
-            f"AUC: {train_stats['auc_roc']:.4f}"
+            f"\n{train_label} Loss: {curve_train_stats['loss']:.4f} | "
+            f"ProtoReg: {curve_train_stats['proto_reg_loss']:.4f} | "
+            f"F1: {curve_train_stats['f1']:.4f} | BAcc: {curve_train_stats['bacc']:.4f} | "
+            f"AUC: {curve_train_stats['auc_roc']:.4f}"
         )
         print(
             f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | "
@@ -582,9 +611,17 @@ def edl_proto_dirichlet_train_loop(train_loader, valid_loader, model, optimizer,
             f"AUC: {val_stats['auc_roc']:.4f}"
         )
 
-        _append_epoch_stats(train_results, train_stats)
+        _append_epoch_stats(train_results, curve_train_stats)
         _append_epoch_stats(val_results, val_stats)
-        save_dirichlet_loss_curve(train_results, val_results, output_path)
+        plot_title = f"EDL k={getattr(args, 'edl_proto_k', 0)} - {format_fold_label(output_path)}"
+        save_dirichlet_loss_curve(
+            train_results,
+            val_results,
+            output_path,
+            train_prefix=train_prefix,
+            train_label=train_label,
+            plot_title=plot_title,
+        )
 
         val_auc = val_stats["auc_roc"]
         val_auc_is_valid = np.isfinite(val_auc)
@@ -1159,6 +1196,7 @@ def do_edl_proto_dirichlet_training(args, device):
         print(f"Train: {len(train_df)}, {valid_split_name.capitalize()}: {len(val_df)}")
 
         train_loader = MIL_dataloader(train_df, "train", args)
+        train_eval_loader = build_train_eval_loader(train_df, args)
         valid_loader = MIL_dataloader(val_df, valid_split_name, args)
 
         pretrained_checkpoint = resolve_mil_checkpoint(args.resume, fold)
@@ -1217,6 +1255,7 @@ def do_edl_proto_dirichlet_training(args, device):
             args,
             device,
             valid_split_name=valid_split_name,
+            train_eval_loader=train_eval_loader,
         )
 
         fold_summary = {

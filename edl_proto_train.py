@@ -33,10 +33,13 @@ from edl_train import (
     _print_load_summary,
     _update_loss_meters,
     build_edl_criterion,
+    build_train_eval_loader,
     config as base_edl_config,
     edl_valid_fn,
     freeze_mil_backbone_train_edl_only,
+    get_train_curve_metadata,
     get_edl_class_weights,
+    format_fold_label,
     resolve_mil_checkpoint,
     save_loss_curve,
 )
@@ -482,7 +485,8 @@ def evaluate_proto_regularization(loader, model, args, device, desc="DST_PROTO v
 
 
 def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler, scaler,
-                         criterion, output_path, args, device, valid_split_name="val"):
+                         criterion, output_path, args, device, valid_split_name="val",
+                         train_eval_loader=None):
 
     best_aucroc = -float("inf")
     best_val_loss = float("inf")
@@ -495,6 +499,7 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
 
     train_results = _init_epoch_history(include_lr=True)
     val_results = _init_epoch_history(include_lr=False)
+    train_prefix, train_label = get_train_curve_metadata(train_eval_loader)
     for key in [
         "proto_reg_loss",
         "proto_attract_loss",
@@ -511,6 +516,27 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         train_stats = edl_proto_train_fn(
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, device
         )
+        curve_train_stats = train_stats
+        if train_eval_loader is not None:
+            _, _, _, curve_train_stats, _ = edl_valid_fn(
+                train_eval_loader,
+                model,
+                args,
+                device,
+                split="train_eval",
+                epoch=epoch,
+                criterion_eval=criterion,
+            )
+            train_eval_proto_stats = evaluate_proto_regularization(
+                train_eval_loader,
+                model,
+                args,
+                device,
+                desc=f"[{epoch + 1:03d}/{args.epochs:03d} DST_PROTO train-eval proto-reg]",
+            )
+            curve_train_stats.update(train_eval_proto_stats)
+            curve_train_stats["loss"] = curve_train_stats["loss"] + train_eval_proto_stats["proto_reg_loss"]
+            curve_train_stats["lr"] = train_stats["lr"]
         _, _, _, val_stats, _ = edl_valid_fn(
             valid_loader,
             model,
@@ -533,10 +559,10 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
         _ = time.time() - start_time
         valid_display_name = "Test" if valid_split_name == "test" else "Val"
         print(
-            f"\nTrain Loss: {train_stats['loss']:.4f} | "
-            f"ProtoReg: {train_stats['proto_reg_loss']:.4f} | "
-            f"F1: {train_stats['f1']:.4f} | BAcc: {train_stats['bacc']:.4f} | "
-            f"AUC: {train_stats['auc_roc']:.4f}"
+            f"\n{train_label} Loss: {curve_train_stats['loss']:.4f} | "
+            f"ProtoReg: {curve_train_stats['proto_reg_loss']:.4f} | "
+            f"F1: {curve_train_stats['f1']:.4f} | BAcc: {curve_train_stats['bacc']:.4f} | "
+            f"AUC: {curve_train_stats['auc_roc']:.4f}"
         )
         print(
             f"{valid_display_name}   Loss: {val_stats['loss']:.4f} | "
@@ -545,9 +571,17 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
             f"AUC: {val_stats['auc_roc']:.4f}"
         )
 
-        _append_epoch_stats(train_results, train_stats)
+        _append_epoch_stats(train_results, curve_train_stats)
         _append_epoch_stats(val_results, val_stats)
-        save_loss_curve(train_results, val_results, output_path)
+        plot_title = f"DST k={getattr(args, 'edl_proto_k', 0)} - {format_fold_label(output_path)}"
+        save_loss_curve(
+            train_results,
+            val_results,
+            output_path,
+            train_prefix=train_prefix,
+            train_label=train_label,
+            plot_title=plot_title,
+        )
 
         val_auc = val_stats["auc_roc"]
         val_auc_is_valid = np.isfinite(val_auc)
@@ -894,6 +928,7 @@ def do_edl_proto_training(args, device):
         print(f"Train: {len(train_df)}, {valid_split_name.capitalize()}: {len(val_df)}")
 
         train_loader = MIL_dataloader(train_df, "train", args)
+        train_eval_loader = build_train_eval_loader(train_df, args)
         valid_loader = MIL_dataloader(val_df, valid_split_name, args)
 
         pretrained_checkpoint = resolve_mil_checkpoint(args.resume, fold)
@@ -952,6 +987,7 @@ def do_edl_proto_training(args, device):
             args,
             device,
             valid_split_name=valid_split_name,
+            train_eval_loader=train_eval_loader,
         )
 
         fold_summary = {
