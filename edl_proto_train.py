@@ -63,8 +63,13 @@ def _add_proto_args(parser):
                         help="Initial DST prototype reliability logit.")
     parser.add_argument("--edl_proto_normalize", default="y", choices=["y", "n"],
                         help="Normalize embeddings and prototypes before distance computation.")
-    parser.add_argument("--edl_proto_init", default="kmeans", choices=["kmeans", "random"],
-                        help="Prototype initialization method.")
+    parser.add_argument("--edl_proto_init", default="embedding_bank",
+                        choices=["embedding_bank", "best_samples", "kmeans", "random"],
+                        help=(
+                            "Prototype initialization method. embedding_bank loads "
+                            "prototype_bank.csv from --embedding_cache_dir; best_samples selects "
+                            "real train samples with the highest true-class confidence per class."
+                        ))
     parser.add_argument("--edl_proto_attract_weight", default=0.1, type=float,
                         help="Weight for pulling samples toward same-class prototypes.")
     parser.add_argument("--edl_proto_separation_weight", default=0.1, type=float,
@@ -125,11 +130,13 @@ def build_edl_proto_model(args, checkpoint_path=None):
             "so the Mammo-CLIP image encoder/backbone can be initialized."
         )
 
+    checkpoint_payload = None
     checkpoint_state = None
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
         if checkpoint_path.is_file():
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            checkpoint_payload = checkpoint if isinstance(checkpoint, dict) else None
             checkpoint_state = _get_checkpoint_state_dict(checkpoint)
         else:
             print(f"[DST_PROTO] Warning: checkpoint not found at {checkpoint_path}; training from scratch.")
@@ -151,6 +158,8 @@ def build_edl_proto_model(args, checkpoint_path=None):
             load_msg = model.load_state_dict(checkpoint_state, strict=False)
             print(f"[DST_PROTO] Loaded Prototype-DST checkpoint from: {checkpoint_path}")
             _print_load_summary("[DST_PROTO][load]", load_msg)
+            if checkpoint_payload is not None:
+                _attach_prototype_bank(model, checkpoint_payload.get("prototype_bank"))
         return model, checkpoint_state is not None and is_proto_checkpoint
 
     mil_model = build_model(args)
@@ -180,6 +189,8 @@ def build_edl_proto_model(args, checkpoint_path=None):
                 "prototype heads will be initialized separately."
             )
         _print_load_summary("[DST_PROTO][wrapped load]", load_msg)
+        if checkpoint_payload is not None:
+            _attach_prototype_bank(model, checkpoint_payload.get("prototype_bank"))
 
     return model, is_proto_checkpoint
 
@@ -610,6 +621,7 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
             )
             torch.save({
                 "model": model.state_dict(),
+                "prototype_bank": _get_prototype_bank_records(model),
                 "epoch": epoch,
                 "auroc": val_stats["auc_roc"],
                 "f1": val_stats["f1"],
@@ -646,31 +658,324 @@ def edl_proto_train_loop(train_loader, valid_loader, model, optimizer, scheduler
     return best_val_stats, best_checkpoint_path
 
 
+def _attach_prototype_bank(model, prototype_bank):
+    if prototype_bank is None:
+        return None
+
+    if isinstance(prototype_bank, pd.DataFrame):
+        bank_df = prototype_bank.copy()
+    else:
+        bank_df = pd.DataFrame(prototype_bank)
+
+    if bank_df.empty:
+        return None
+
+    for col in ["head_name", "source_patient_id", "source_image_id", "prototype_id", "selection_method"]:
+        if col in bank_df.columns:
+            bank_df[col] = bank_df[col].astype(str)
+
+    model._prototype_bank_df = bank_df.reset_index(drop=True)
+    return model._prototype_bank_df
+
+
+def _get_prototype_bank_df(model):
+    bank_df = getattr(model, "_prototype_bank_df", None)
+    if bank_df is None or len(bank_df) == 0:
+        return None
+    return bank_df.copy()
+
+
+def _get_prototype_bank_records(model):
+    bank_df = _get_prototype_bank_df(model)
+    if bank_df is None:
+        return None
+    return bank_df.to_dict(orient="records")
+
+
+def save_prototype_bank_csv(output_path, model):
+    bank_df = _get_prototype_bank_df(model)
+    if bank_df is None:
+        return None
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    bank_df.to_csv(output_path, index=False)
+    print(f"[DST_PROTO] Prototype bank saved: {output_path}")
+    return output_path
+
+
+def _normalize_prototype_matrix(values):
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    return values / np.clip(norms, 1e-12, None)
+
+
+def _embedding_bank_row_value(row, *keys, default=None):
+    for key in keys:
+        if key in row and not pd.isna(row[key]):
+            value = row[key]
+            if isinstance(value, np.generic):
+                value = value.item()
+            return value
+    return default
+
+
+def _load_head_prototypes_from_embedding_bank(head, head_name, bank_df, embeddings):
+    if "head_name" in bank_df.columns:
+        head_rows = bank_df[bank_df["head_name"].astype(str) == str(head_name)].copy()
+        if head_rows.empty:
+            head_rows = bank_df.copy()
+    else:
+        head_rows = bank_df.copy()
+
+    prototype_vectors = []
+    normalized_rows = []
+    warnings_list = []
+
+    for class_idx in range(head.num_classes):
+        class_df = head_rows[head_rows["prototype_class"].astype(int) == class_idx].copy()
+        if class_df.empty:
+            raise RuntimeError(f"Prototype bank has no class {class_idx} rows for {head_name}.")
+
+        sort_cols = [
+            col
+            for col in ["prototype_rank", "prototype_global_idx", "selection_rank"]
+            if col in class_df.columns
+        ]
+        if sort_cols:
+            class_df = class_df.sort_values(sort_cols)
+        class_df = class_df.reset_index(drop=True)
+
+        if len(class_df) < head.prototypes_per_class:
+            warnings_list.append(
+                f"class {class_idx} has {len(class_df)} bank prototypes; "
+                f"repeating rows to fill {head.prototypes_per_class}"
+            )
+
+        for rank_idx in range(head.prototypes_per_class):
+            row = class_df.iloc[rank_idx % len(class_df)].to_dict()
+            embedding_row = int(_embedding_bank_row_value(
+                row,
+                "embedding_row",
+                "embedding_start",
+                default=-1,
+            ))
+            if embedding_row < 0 or embedding_row >= int(embeddings.shape[0]):
+                raise RuntimeError(
+                    f"Prototype bank row points to invalid embedding_row={embedding_row} "
+                    f"for {head_name} class {class_idx} rank {rank_idx}."
+                )
+            prototype_vectors.append(np.asarray(embeddings[embedding_row], dtype=np.float32))
+            global_idx = class_idx * head.prototypes_per_class + rank_idx
+            row.update({
+                "head_name": head_name,
+                "prototype_global_idx": global_idx,
+                "prototype_class": class_idx,
+                "prototype_rank": rank_idx,
+                "prototype_id": f"c{class_idx}_p{rank_idx}",
+                "selection_rank": rank_idx,
+                "selection_method": str(row.get("selection_method", "embedding_bank")),
+                "embedding_row": embedding_row,
+            })
+            normalized_rows.append(row)
+
+    prototype_array = np.asarray(prototype_vectors, dtype=np.float32)
+    if head.normalize:
+        prototype_array = _normalize_prototype_matrix(prototype_array)
+    prototype_array = prototype_array.reshape(
+        head.num_classes,
+        head.prototypes_per_class,
+        head.in_features,
+    )
+    head.set_prototypes_from_embeddings(prototype_array)
+    return normalized_rows, warnings_list
+
+
+def initialize_prototypes_from_embedding_bank(model, args):
+    if getattr(args, "feature_extraction", None) != "bag_embedding":
+        return None
+    cache_dir = getattr(args, "embedding_cache_dir", None)
+    if cache_dir is None:
+        return None
+
+    cache_dir = Path(cache_dir)
+    bank_path = cache_dir / "prototype_bank.csv"
+    embeddings_path = cache_dir / "embeddings.npy"
+    if not bank_path.exists() or not embeddings_path.exists():
+        return None
+
+    heads = model.prototype_heads()
+    if not heads:
+        return None
+
+    bank_df = pd.read_csv(bank_path)
+    embeddings = np.load(embeddings_path, mmap_mode="r")
+    bank_rows = []
+
+    print(f"[DST_PROTO] Loading prototypes from embedding bank: {bank_path}")
+    for head_name, head in heads.items():
+        selected_rows, warnings_list = _load_head_prototypes_from_embedding_bank(
+            head,
+            head_name,
+            bank_df,
+            embeddings,
+        )
+        bank_rows.extend(selected_rows)
+        print(
+            f"[DST_PROTO] {head_name}: loaded {head.num_classes * head.prototypes_per_class} "
+            f"prototypes from embedding bank."
+        )
+        for warning_text in warnings_list:
+            print(f"[DST_PROTO] Warning: {head_name}: {warning_text}")
+
+    return _attach_prototype_bank(model, bank_rows)
+
+
+def _to_str_list(values):
+    return ["" if value is None else str(value) for value in values]
+
+
+def _select_best_sample_prototypes(head, bucket, head_name):
+    embeddings = torch.cat(bucket["embeddings"], dim=0).float().cpu().numpy()
+    labels = torch.cat(bucket["labels"], dim=0).long().cpu().numpy().astype(int)
+    prediction_scores = torch.cat(bucket["prediction_scores"], dim=0).float().cpu().numpy()
+    true_class_scores = torch.cat(bucket["true_class_scores"], dim=0).float().cpu().numpy()
+    preds = torch.cat(bucket["preds"], dim=0).long().cpu().numpy().astype(int)
+    patient_ids = _to_str_list(bucket["patient_id"])
+    image_ids = _to_str_list(bucket["image_id"])
+    source_rows = np.concatenate(bucket["source_row"], axis=0).astype(int)
+
+    if embeddings.ndim != 2 or embeddings.shape[1] != head.in_features:
+        raise ValueError(
+            f"{head_name}: expected embeddings with shape (N, {head.in_features}), "
+            f"got {embeddings.shape}."
+        )
+    if embeddings.shape[0] == 0:
+        raise ValueError(f"{head_name}: cannot select prototypes from an empty embedding set.")
+
+    prototype_vectors = []
+    bank_rows = []
+    warnings_list = []
+
+    working_embeddings = embeddings.astype(np.float32, copy=True)
+    if head.normalize:
+        norms = np.linalg.norm(working_embeddings, axis=1, keepdims=True)
+        working_embeddings = working_embeddings / np.clip(norms, 1e-12, None)
+
+    global_order = np.lexsort((source_rows, -true_class_scores, -(preds == labels).astype(int)))
+
+    for class_idx in range(head.num_classes):
+        class_indices = np.where(labels == class_idx)[0]
+        if len(class_indices) == 0:
+            ordered = global_order
+            warnings_list.append(
+                f"class {class_idx} has no samples; reusing global high-confidence samples"
+            )
+        else:
+            correct = (preds[class_indices] == labels[class_indices]).astype(int)
+            ordered = class_indices[
+                np.lexsort((source_rows[class_indices], -true_class_scores[class_indices], -correct))
+            ]
+
+        if len(ordered) < head.prototypes_per_class:
+            warnings_list.append(
+                f"class {class_idx} has {len(ordered)} samples; repeating selected samples "
+                f"to fill {head.prototypes_per_class} prototypes"
+            )
+
+        for rank_idx in range(head.prototypes_per_class):
+            source_idx = int(ordered[rank_idx % len(ordered)])
+            prototype_vectors.append(working_embeddings[source_idx])
+            global_idx = class_idx * head.prototypes_per_class + rank_idx
+            bank_rows.append({
+                "head_name": head_name,
+                "prototype_global_idx": global_idx,
+                "prototype_class": class_idx,
+                "prototype_rank": rank_idx,
+                "prototype_id": f"c{class_idx}_p{rank_idx}",
+                "source_patient_id": patient_ids[source_idx],
+                "source_image_id": image_ids[source_idx],
+                "source_label": int(labels[source_idx]),
+                "source_prediction_score": float(prediction_scores[source_idx]),
+                "source_true_class_score": float(true_class_scores[source_idx]),
+                "source_selection_score": float(true_class_scores[source_idx]),
+                "source_selection_class": int(class_idx),
+                "source_predicted_class": int(preds[source_idx]),
+                "source_correct": bool(preds[source_idx] == labels[source_idx]),
+                "source_train_row": int(source_rows[source_idx]),
+                "selection_rank": rank_idx,
+                "selection_method": "best_samples",
+            })
+
+    prototype_array = np.asarray(prototype_vectors, dtype=np.float32).reshape(
+        head.num_classes,
+        head.prototypes_per_class,
+        head.in_features,
+    )
+    head.set_prototypes_from_embeddings(prototype_array)
+    return bank_rows, warnings_list
+
+
 @torch.no_grad()
 def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
-    if args.edl_proto_init != "kmeans":
-        print("[DST_PROTO] Prototype KMeans initialization skipped; using random init.")
-        return
+    init_method = getattr(args, "edl_proto_init", "embedding_bank")
+    if init_method == "random":
+        print("[DST_PROTO] Prototype initialization skipped; using random init.")
+        return None
 
     heads = model.prototype_heads()
     if not heads:
         print("[DST_PROTO] No prototype heads found; skipping initialization.")
-        return
+        return None
 
-    print("[DST_PROTO] Initializing prototypes with train-fold KMeans embeddings...")
+    if init_method == "embedding_bank":
+        bank_df = initialize_prototypes_from_embedding_bank(model, args)
+        if bank_df is not None:
+            return bank_df
+        print(
+            "[DST_PROTO] Prototype embedding bank not found or not applicable; "
+            "falling back to best_samples initialization."
+        )
+        init_method = "best_samples"
+
+    if init_method == "kmeans":
+        print("[DST_PROTO] Initializing prototypes with train-fold KMeans embeddings...")
+    elif init_method == "best_samples":
+        print(
+            "[DST_PROTO] Initializing prototypes with best train samples "
+            "(highest true-class confidence, correct predictions first)..."
+        )
+    else:
+        raise ValueError(f"Unsupported --edl_proto_init: {init_method}")
+
     init_loader = MIL_dataloader(train_df, "test", args)
     buckets = {
-        name: {"embeddings": [], "labels": []}
+        name: {
+            "embeddings": [],
+            "labels": [],
+            "prediction_scores": [],
+            "true_class_scores": [],
+            "preds": [],
+            "patient_id": [],
+            "image_id": [],
+            "source_row": [],
+        }
         for name in heads.keys()
     }
     current_labels = None
+    current_patient_ids = None
+    current_image_ids = None
+    current_source_rows = None
+    seen_heads = []
 
     def make_hook(head_name):
         def hook(module, inputs):
             if current_labels is None:
                 return
+            seen_heads.append(head_name)
             buckets[head_name]["embeddings"].append(inputs[0].detach().float().cpu())
             buckets[head_name]["labels"].append(current_labels.detach().cpu())
+            buckets[head_name]["patient_id"].extend(current_patient_ids)
+            buckets[head_name]["image_id"].extend(current_image_ids)
+            buckets[head_name]["source_row"].append(current_source_rows.copy())
         return hook
 
     handles = [
@@ -685,30 +990,55 @@ def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
 
     try:
         progress_iter = tqdm(init_loader, desc=f"[fold {fold} DST_PROTO init]", total=len(init_loader))
+        source_offset = 0
         for data in progress_iter:
             current_labels = data["y"].long().to(device)
+            batch_size = current_labels.size(0)
+            current_patient_ids = data.get("patient_id", [None] * batch_size)
+            current_image_ids = data.get("image_id", [None] * batch_size)
+            current_source_rows = np.arange(source_offset, source_offset + batch_size, dtype=np.int64)
+            source_offset += batch_size
+            seen_heads = []
             inputs = _move_inputs_to_device(data, device, non_blocking=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled):
-                _ = model(inputs)
+                edl_out = model(inputs)
+
+            prob = edl_out["prob"].detach().float().cpu()
+            preds = torch.argmax(prob, dim=-1)
+            labels_cpu = current_labels.detach().cpu().long()
+            true_class_scores = prob.gather(1, labels_cpu.view(-1, 1)).squeeze(1)
+            prediction_scores = prob[:, 1]
+            for head_name in seen_heads:
+                buckets[head_name]["prediction_scores"].append(prediction_scores)
+                buckets[head_name]["true_class_scores"].append(true_class_scores)
+                buckets[head_name]["preds"].append(preds)
     finally:
         for handle in handles:
             handle.remove()
         model.train(was_training)
 
+    bank_rows = []
     for name, head in heads.items():
         embeddings = torch.cat(buckets[name]["embeddings"], dim=0)
         labels = torch.cat(buckets[name]["labels"], dim=0)
-        warnings_list = head.initialize_from_embeddings(
-            embeddings,
-            labels,
-            random_state=args.seed + fold,
-        )
+        if init_method == "kmeans":
+            warnings_list = head.initialize_from_embeddings(
+                embeddings,
+                labels,
+                random_state=args.seed + fold,
+            )
+        else:
+            selected_rows, warnings_list = _select_best_sample_prototypes(head, buckets[name], name)
+            bank_rows.extend(selected_rows)
         print(
             f"[DST_PROTO] {name}: initialized {head.num_classes * head.prototypes_per_class} "
-            f"prototypes from {len(labels)} training embeddings."
+            f"prototypes from {len(labels)} training embeddings using {init_method}."
         )
         for warning_text in warnings_list:
             print(f"[DST_PROTO] Warning: {name}: {warning_text}")
+
+    bank_df = _attach_prototype_bank(model, bank_rows) if bank_rows else None
+    return bank_df
 
 
 def expected_proto_columns(args):
@@ -719,31 +1049,194 @@ def expected_proto_columns(args):
             prefix = f"proto_c{class_idx}_top{rank}"
             columns.extend([
                 f"{prefix}_idx",
+                f"{prefix}_global_idx",
                 f"{prefix}_evidence",
                 f"{prefix}_mass",
                 f"{prefix}_similarity",
                 f"{prefix}_distance",
+                f"{prefix}_source_patient_id",
+                f"{prefix}_source_image_id",
+                f"{prefix}_source_label",
+                f"{prefix}_source_prediction_score",
+                f"{prefix}_source_true_class_score",
+                f"{prefix}_source_selection_score",
+                f"{prefix}_source_selection_class",
+                f"{prefix}_source_predicted_class",
+                f"{prefix}_source_correct",
             ])
+    columns.extend([
+        "proto_nearest_global_idx",
+        "proto_nearest_class",
+        "proto_nearest_idx",
+        "proto_nearest_similarity",
+        "proto_nearest_distance",
+        "proto_nearest_mass",
+        "proto_nearest_source_patient_id",
+        "proto_nearest_source_image_id",
+        "proto_nearest_source_label",
+        "proto_nearest_source_prediction_score",
+        "proto_nearest_source_true_class_score",
+        "proto_nearest_source_selection_score",
+        "proto_nearest_source_selection_class",
+        "proto_nearest_source_predicted_class",
+        "proto_nearest_source_correct",
+    ])
     return columns
 
 
 def _append_proto_batch(proto_buffers, edl_out):
-    if "topk_proto_idx" not in edl_out:
+    if "topk_proto_idx" in edl_out:
+        top_idx = edl_out["topk_proto_idx"].detach().cpu().numpy()
+        top_evidence = edl_out["topk_proto_evidence"].detach().cpu().numpy()
+        top_similarity = edl_out["topk_proto_similarity"].detach().cpu().numpy()
+        top_distances = edl_out["topk_proto_distances"].detach().cpu().numpy()
+        prototypes_per_class = (
+            int(edl_out["prototype_similarity"].shape[2])
+            if "prototype_similarity" in edl_out
+            else int(top_idx.shape[2])
+        )
+
+        for class_idx in range(top_idx.shape[1]):
+            for rank_idx in range(top_idx.shape[2]):
+                prefix = f"proto_c{class_idx}_top{rank_idx + 1}"
+                proto_buffers.setdefault(f"{prefix}_idx", []).append(top_idx[:, class_idx, rank_idx])
+                proto_buffers.setdefault(f"{prefix}_global_idx", []).append(
+                    class_idx * prototypes_per_class + top_idx[:, class_idx, rank_idx]
+                )
+                proto_buffers.setdefault(f"{prefix}_evidence", []).append(top_evidence[:, class_idx, rank_idx])
+                proto_buffers.setdefault(f"{prefix}_mass", []).append(top_evidence[:, class_idx, rank_idx])
+                proto_buffers.setdefault(f"{prefix}_similarity", []).append(top_similarity[:, class_idx, rank_idx])
+                proto_buffers.setdefault(f"{prefix}_distance", []).append(top_distances[:, class_idx, rank_idx])
+
+    if "prototype_similarity" in edl_out and "prototype_distances" in edl_out:
+        similarity = edl_out["prototype_similarity"].detach().cpu().numpy()
+        distances = edl_out["prototype_distances"].detach().cpu().numpy()
+        prototype_mass = edl_out.get("prototype_mass", edl_out.get("prototype_evidence"))
+        mass_values = prototype_mass.detach().cpu().numpy() if prototype_mass is not None else None
+        batch_idx = np.arange(similarity.shape[0])
+        prototypes_per_class = similarity.shape[2]
+        flat_similarity = similarity.reshape(similarity.shape[0], -1)
+        nearest_global = np.argmax(flat_similarity, axis=1)
+        nearest_class = nearest_global // prototypes_per_class
+        nearest_idx = nearest_global % prototypes_per_class
+        proto_buffers.setdefault("proto_nearest_global_idx", []).append(nearest_global)
+        proto_buffers.setdefault("proto_nearest_class", []).append(nearest_class)
+        proto_buffers.setdefault("proto_nearest_idx", []).append(nearest_idx)
+        proto_buffers.setdefault("proto_nearest_similarity", []).append(
+            similarity[batch_idx, nearest_class, nearest_idx]
+        )
+        proto_buffers.setdefault("proto_nearest_distance", []).append(
+            distances[batch_idx, nearest_class, nearest_idx]
+        )
+        if mass_values is not None:
+            proto_buffers.setdefault("proto_nearest_mass", []).append(
+                mass_values[batch_idx, nearest_class, nearest_idx]
+            )
+
+
+PROTOTYPE_SOURCE_FIELD_SPECS = [
+    ("source_patient_id", "source_patient_id", ""),
+    ("source_image_id", "source_image_id", ""),
+    ("source_label", "source_label", np.nan),
+    ("source_prediction_score", "source_prediction_score", np.nan),
+    ("source_true_class_score", "source_true_class_score", np.nan),
+    ("source_selection_score", "source_selection_score", np.nan),
+    ("source_selection_class", "source_selection_class", np.nan),
+    ("source_predicted_class", "source_predicted_class", np.nan),
+    ("source_correct", "source_correct", np.nan),
+]
+
+
+def _primary_prototype_bank(model):
+    bank_df = _get_prototype_bank_df(model)
+    if bank_df is None:
+        return None, None
+
+    head_name = "edl_head"
+    if "head_name" in bank_df.columns and head_name in set(bank_df["head_name"].astype(str)):
+        bank_df = bank_df[bank_df["head_name"].astype(str) == head_name].copy()
+    elif "head_name" in bank_df.columns and len(bank_df) > 0:
+        head_name = str(bank_df["head_name"].iloc[0])
+        bank_df = bank_df[bank_df["head_name"].astype(str) == head_name].copy()
+
+    if bank_df.empty:
+        return None, None
+    return head_name, bank_df
+
+
+def _prototype_bank_lookup(model):
+    _, bank_df = _primary_prototype_bank(model)
+    if bank_df is None:
+        return {}
+
+    lookup = {}
+    for _, row in bank_df.iterrows():
+        if "prototype_global_idx" not in row:
+            continue
+        try:
+            global_idx = int(row["prototype_global_idx"])
+        except (TypeError, ValueError):
+            continue
+        lookup[global_idx] = row
+    return lookup
+
+
+def _bank_value(row, field, default):
+    if row is None or field not in row:
+        return default
+    value = row[field]
+    if pd.isna(value):
+        return default
+    if isinstance(value, np.generic):
+        value = value.item()
+    return value
+
+
+def _rows_from_global_indices(global_indices, lookup):
+    rows = []
+    for value in global_indices:
+        try:
+            if pd.isna(value):
+                rows.append(None)
+                continue
+            global_idx = int(value)
+        except (TypeError, ValueError):
+            rows.append(None)
+            continue
+        rows.append(lookup.get(global_idx))
+    return rows
+
+
+def _append_source_columns_for_prefix(results, prefix, global_indices, lookup):
+    rows = _rows_from_global_indices(global_indices, lookup)
+    for bank_field, suffix, default in PROTOTYPE_SOURCE_FIELD_SPECS:
+        results[f"{prefix}_{suffix}"] = [
+            _bank_value(row, bank_field, default)
+            for row in rows
+        ]
+
+
+def _add_prototype_source_columns(results, model, args):
+    lookup = _prototype_bank_lookup(model)
+    if not lookup:
         return
 
-    top_idx = edl_out["topk_proto_idx"].detach().cpu().numpy()
-    top_evidence = edl_out["topk_proto_evidence"].detach().cpu().numpy()
-    top_similarity = edl_out["topk_proto_similarity"].detach().cpu().numpy()
-    top_distances = edl_out["topk_proto_distances"].detach().cpu().numpy()
+    topk = max(0, min(int(args.edl_proto_topk), int(args.edl_proto_k)))
+    for class_idx in range(2):
+        for rank in range(1, topk + 1):
+            prefix = f"proto_c{class_idx}_top{rank}"
+            global_key = f"{prefix}_global_idx"
+            if global_key not in results:
+                continue
+            _append_source_columns_for_prefix(results, prefix, results[global_key], lookup)
 
-    for class_idx in range(top_idx.shape[1]):
-        for rank_idx in range(top_idx.shape[2]):
-            prefix = f"proto_c{class_idx}_top{rank_idx + 1}"
-            proto_buffers.setdefault(f"{prefix}_idx", []).append(top_idx[:, class_idx, rank_idx])
-            proto_buffers.setdefault(f"{prefix}_evidence", []).append(top_evidence[:, class_idx, rank_idx])
-            proto_buffers.setdefault(f"{prefix}_mass", []).append(top_evidence[:, class_idx, rank_idx])
-            proto_buffers.setdefault(f"{prefix}_similarity", []).append(top_similarity[:, class_idx, rank_idx])
-            proto_buffers.setdefault(f"{prefix}_distance", []).append(top_distances[:, class_idx, rank_idx])
+    if "proto_nearest_global_idx" in results:
+        _append_source_columns_for_prefix(
+            results,
+            "proto_nearest",
+            results["proto_nearest_global_idx"],
+            lookup,
+        )
 
 
 INTERPRETABILITY_TENSOR_KEYS = [
@@ -806,6 +1299,59 @@ def _extract_primary_prototype_state(model):
         shape = (head.num_classes, head.prototypes_per_class)
         arrays["prototype_reliability"] = reliability.view(shape).numpy()
         arrays["prototype_gamma"] = gamma.view(shape).numpy()
+
+    _, bank_df = _primary_prototype_bank(model)
+    if bank_df is not None:
+        shape = (head.num_classes, head.prototypes_per_class)
+        source_patient_id = np.full(shape, "", dtype="<U256")
+        source_image_id = np.full(shape, "", dtype="<U256")
+        source_label = np.full(shape, -1, dtype=np.int64)
+        source_prediction_score = np.full(shape, np.nan, dtype=np.float32)
+        source_true_class_score = np.full(shape, np.nan, dtype=np.float32)
+        source_selection_score = np.full(shape, np.nan, dtype=np.float32)
+        source_selection_class = np.full(shape, -1, dtype=np.int64)
+        source_predicted_class = np.full(shape, -1, dtype=np.int64)
+        source_correct = np.full(shape, False, dtype=bool)
+
+        for _, row in bank_df.iterrows():
+            try:
+                class_idx = int(row["prototype_class"])
+                rank_idx = int(row["prototype_rank"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if class_idx < 0 or class_idx >= shape[0] or rank_idx < 0 or rank_idx >= shape[1]:
+                continue
+            source_patient_id[class_idx, rank_idx] = str(_bank_value(row, "source_patient_id", ""))
+            source_image_id[class_idx, rank_idx] = str(_bank_value(row, "source_image_id", ""))
+            source_label[class_idx, rank_idx] = int(_bank_value(row, "source_label", -1))
+            source_prediction_score[class_idx, rank_idx] = float(
+                _bank_value(row, "source_prediction_score", np.nan)
+            )
+            source_true_class_score[class_idx, rank_idx] = float(
+                _bank_value(row, "source_true_class_score", np.nan)
+            )
+            source_selection_score[class_idx, rank_idx] = float(
+                _bank_value(row, "source_selection_score", np.nan)
+            )
+            source_selection_class[class_idx, rank_idx] = int(
+                _bank_value(row, "source_selection_class", class_idx)
+            )
+            source_predicted_class[class_idx, rank_idx] = int(
+                _bank_value(row, "source_predicted_class", -1)
+            )
+            source_correct[class_idx, rank_idx] = bool(_bank_value(row, "source_correct", False))
+
+        arrays.update({
+            "prototype_source_patient_id": source_patient_id,
+            "prototype_source_image_id": source_image_id,
+            "prototype_source_label": source_label,
+            "prototype_source_prediction_score": source_prediction_score,
+            "prototype_source_true_class_score": source_true_class_score,
+            "prototype_source_selection_score": source_selection_score,
+            "prototype_source_selection_class": source_selection_class,
+            "prototype_source_predicted_class": source_predicted_class,
+            "prototype_source_correct": source_correct,
+        })
 
     return arrays
 
@@ -914,6 +1460,8 @@ def edl_proto_predict(loader, model, args, device, desc="DST_PROTO predict"):
 
     for key, chunks in interpretability_buffers.items():
         results[key] = np.concatenate(chunks, axis=0)
+
+    _add_prototype_source_columns(results, model, args)
 
     return results
 
@@ -1050,7 +1598,17 @@ def do_edl_proto_training(args, device):
         model.to(device)
 
         if not loaded_proto_checkpoint:
-            initialize_prototypes_from_train_split(model, train_df, args, device, fold)
+            prototype_bank_df = initialize_prototypes_from_train_split(model, train_df, args, device, fold)
+            if prototype_bank_df is not None:
+                save_prototype_bank_csv(
+                    path_results_fold / f"{args.dataset}_dst_proto_prototype_bank_fold_{fold}.csv",
+                    model,
+                )
+        else:
+            save_prototype_bank_csv(
+                path_results_fold / f"{args.dataset}_dst_proto_prototype_bank_fold_{fold}.csv",
+                model,
+            )
 
         if args.train_edl_only:
             freeze_mil_backbone_train_edl_only(model)
@@ -1125,6 +1683,11 @@ def do_edl_proto_training(args, device):
         print(f"\nGenerating Prototype-DST predictions with best model for fold {fold}...")
         checkpoint = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
+        _attach_prototype_bank(model, checkpoint.get("prototype_bank"))
+        save_prototype_bank_csv(
+            path_results_fold / f"{args.dataset}_dst_proto_prototype_bank_fold_{fold}.csv",
+            model,
+        )
         model.eval()
 
         all_split_dfs = []

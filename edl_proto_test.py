@@ -18,6 +18,7 @@ from edl_proto_train import (
     build_edl_proto_model,
     build_prediction_df,
     edl_proto_predict,
+    save_prototype_bank_csv,
     save_dst_proto_interpretability_npz,
 )
 from edl_test import config as base_edl_test_config
@@ -91,7 +92,19 @@ def _build_ensemble(test_all_df, args):
 
     for col in test_all_df.columns:
         if col.startswith("proto_"):
-            agg_spec[col] = _mode_first if col.endswith("_idx") else "mean"
+            if col.endswith((
+                "_evidence",
+                "_mass",
+                "_similarity",
+                "_distance",
+                "_prediction_score",
+                "_true_class_score",
+            )):
+                agg_spec[col] = "mean"
+            elif col.endswith("_correct"):
+                agg_spec[col] = _mode_first
+            else:
+                agg_spec[col] = _mode_first
 
     ensemble = test_all_df.groupby(["patient_id", "image_id"]).agg(agg_spec).reset_index()
     ensemble["fold"] = "ensemble"
@@ -171,6 +184,10 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
 
         model, _ = build_edl_proto_model(args, ckpt_path)
         model.to(device)
+        save_prototype_bank_csv(
+            output_dir / f"{args.dataset}_dst_proto_prototype_bank_fold_{fold}.csv",
+            model,
+        )
 
         val_df = fold_val_dfs.get(fold, pd.DataFrame()).reset_index(drop=True)
         if len(val_df) == 0:
@@ -228,6 +245,10 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
 
             model, _ = build_edl_proto_model(args, ckpt_path)
             model.to(device)
+            save_prototype_bank_csv(
+                output_dir / f"{args.dataset}_dst_proto_prototype_bank_fold_{fold}.csv",
+                model,
+            )
 
             test_loader = MIL_dataloader(test_df, "test", args)
             test_results = edl_proto_predict(

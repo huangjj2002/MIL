@@ -65,6 +65,30 @@ class PrototypeEDLHead(nn.Module):
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.ds_module.ds1.w)
 
+    def set_prototypes_from_embeddings(self, prototypes):
+        if isinstance(prototypes, torch.Tensor):
+            prototype_array = prototypes.detach().cpu().float().numpy()
+        else:
+            prototype_array = np.asarray(prototypes, dtype=np.float32)
+
+        expected_shape = (self.num_classes, self.prototypes_per_class, self.in_features)
+        if prototype_array.shape == (self.n_prototypes, self.in_features):
+            prototype_array = prototype_array.reshape(expected_shape)
+        if prototype_array.shape != expected_shape:
+            raise ValueError(
+                f"Expected prototypes with shape {expected_shape} or "
+                f"({self.n_prototypes}, {self.in_features}), got {prototype_array.shape}."
+            )
+
+        with torch.no_grad():
+            self.ds_module.ds1.w.copy_(
+                torch.as_tensor(
+                    prototype_array.reshape(self.n_prototypes, self.in_features),
+                    dtype=self.ds_module.ds1.w.dtype,
+                    device=self.ds_module.ds1.w.device,
+                )
+            )
+
     def forward(self, x):
         x = self.drop(x.float())
         mass, distances, similarity, mass_prototypes = self.ds_module(

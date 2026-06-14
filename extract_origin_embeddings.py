@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -89,6 +90,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum number of rows exported per split, useful for smoke tests.",
     )
     parser.add_argument("--seed", default=10, type=int)
+    parser.add_argument(
+        "--prototype-k",
+        "--prototype_k",
+        dest="prototype_k",
+        default=10,
+        type=int,
+        help=(
+            "For bag_origin exports, select K real train samples per class as "
+            "downstream DST prototypes. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--prototype-split",
+        "--prototype_split",
+        dest="prototype_split",
+        default="train",
+        choices=["train", "train_val", "all"],
+        help="Rows eligible for prototype selection during bag_origin export.",
+    )
 
     # Image and encoder settings
     parser.add_argument("--arch", default="upmc_breast_clip_det_b5_period_n_ft", type=str)
@@ -143,8 +163,12 @@ def parse_args() -> argparse.Namespace:
         "--embedding_level",
         dest="embedding_level",
         default="patch_encoder",
-        choices=["patch_encoder", "bag_origin"],
-        help="patch_encoder exports Mammo-CLIP image-encoder patch embeddings; bag_origin exports origin MIL classifier-input embeddings.",
+        choices=["patch_encoder", "bag_origin", "origin_patch"],
+        help=(
+            "patch_encoder exports Mammo-CLIP image-encoder patch embeddings; "
+            "bag_origin exports origin MIL classifier-input bag embeddings; "
+            "origin_patch exports origin MIL encoded patch/token embeddings before MIL pooling."
+        ),
     )
     parser.add_argument(
         "--origin-checkpoint",
@@ -152,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         dest="origin_checkpoint",
         default=None,
         type=str,
-        help="Origin MIL best_model.pth; required for --embedding-level bag_origin.",
+        help="Origin MIL best_model.pth; required for --embedding-level bag_origin or origin_patch.",
     )
 
     # Minimal origin MIL model args for optional bag_origin export.
@@ -228,10 +252,12 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--preview-samples must be non-negative.")
     if args.preview_max_patches < 0:
         raise ValueError("--preview-max-patches must be non-negative.")
-    if args.embedding_level == "bag_origin" and args.origin_checkpoint is None:
-        raise ValueError("--origin-checkpoint is required when --embedding-level bag_origin.")
-    if args.embedding_level == "bag_origin" and args.multi_scale_model == "msp":
-        raise ValueError("bag_origin export does not support multi_scale_model=msp in this script.")
+    if args.prototype_k < 0:
+        raise ValueError("--prototype-k must be non-negative.")
+    if args.embedding_level in {"bag_origin", "origin_patch"} and args.origin_checkpoint is None:
+        raise ValueError("--origin-checkpoint is required when --embedding-level bag_origin or origin_patch.")
+    if args.embedding_level in {"bag_origin", "origin_patch"} and args.multi_scale_model == "msp":
+        raise ValueError(f"{args.embedding_level} export does not support multi_scale_model=msp in this script.")
 
     # Attributes consumed by the existing MIL builders.
     args.feature_extraction = "online"
@@ -561,6 +587,27 @@ def load_origin_mil_model(args: argparse.Namespace, device):
     return model, str(load_msg)
 
 
+def _binary_prob_from_origin_output(output):
+    import torch
+
+    if isinstance(output, (list, tuple)):
+        output = output[0]
+    output = output.detach().float()
+    if output.ndim == 0:
+        output = output.view(1, 1)
+    elif output.ndim == 1:
+        output = output.view(-1, 1)
+
+    if output.size(-1) == 1:
+        pos_prob = torch.sigmoid(output[:, 0])
+        prob = torch.stack([1.0 - pos_prob, pos_prob], dim=-1)
+    elif output.size(-1) == 2:
+        prob = torch.softmax(output, dim=-1)
+    else:
+        raise RuntimeError(f"Expected binary origin model output, got shape {tuple(output.shape)}.")
+    return prob
+
+
 def run_bag_origin(model, patches, args: argparse.Namespace, device):
     import numpy as np
     import torch
@@ -576,7 +623,7 @@ def run_bag_origin(model, patches, args: argparse.Namespace, device):
         with torch.no_grad():
             inputs = patches.unsqueeze(0).to(device, non_blocking=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled):
-                _ = model(inputs)
+                output = model(inputs)
     finally:
         handle.remove()
 
@@ -584,7 +631,134 @@ def run_bag_origin(model, patches, args: argparse.Namespace, device):
         raise RuntimeError("Could not capture bag_origin embedding from model.classifier input.")
     bag_embedding = captured[-1].reshape(1, -1)
     target_dtype = np.float16 if args.dtype == "float16" else np.float32
-    return bag_embedding.numpy().astype(target_dtype, copy=False)
+    prob = _binary_prob_from_origin_output(output).cpu().numpy()
+    return bag_embedding.numpy().astype(target_dtype, copy=False), prob
+
+
+def _origin_patch_hooks(model, args):
+    captures = {}
+    handles = []
+
+    def make_hook(name):
+        def capture_inputs(module, inputs):
+            captures[name] = inputs[0].detach().float().cpu()
+        return capture_inputs
+
+    if hasattr(model, "side_inst_aggregator") and "aggregators" in model.side_inst_aggregator:
+        for scale in args.scales:
+            key = f"aggregator_{scale}"
+            aggregators = model.side_inst_aggregator["aggregators"]
+            if key in aggregators:
+                handles.append(aggregators[key].register_forward_pre_hook(make_hook(scale)))
+    elif hasattr(model, "aggregator"):
+        handles.append(model.aggregator.register_forward_pre_hook(make_hook(args.patch_size)))
+    else:
+        raise ValueError(
+            "Could not find a MIL aggregator to hook for origin_patch export. "
+            "Expected model.aggregator or model.side_inst_aggregator['aggregators']."
+        )
+
+    if not handles:
+        raise ValueError("No origin_patch hooks were registered. Check scales and MIL model configuration.")
+    return captures, handles
+
+
+def _origin_patch_token_rows(coords, scale, num_tokens, args):
+    coords = np.asarray(coords, dtype=np.int32)
+    if len(coords) == 0:
+        return []
+
+    if int(num_tokens) == len(coords):
+        ratio = 1
+    else:
+        ratio = int(math.ceil(float(args.patch_size) / float(scale)))
+        expected_tokens = len(coords) * ratio * ratio
+        if expected_tokens != int(num_tokens):
+            raise RuntimeError(
+                f"Cannot map origin_patch tokens to coordinates for scale={scale}: "
+                f"{num_tokens} tokens vs expected {expected_tokens} from "
+                f"{len(coords)} patches and ratio={ratio}."
+            )
+
+    rows = []
+    token_width = max(1, int(round(float(args.patch_size) / float(ratio))))
+    for token_idx in range(int(num_tokens)):
+        patch_idx = token_idx // (ratio * ratio)
+        cell_idx = token_idx % (ratio * ratio)
+        cell_y = cell_idx // ratio
+        cell_x = cell_idx % ratio
+        base_x, base_y = coords[patch_idx]
+        rows.append(
+            {
+                "scale": int(scale),
+                "patch_idx": int(patch_idx),
+                "token_idx": int(token_idx),
+                "cell_x": int(cell_x),
+                "cell_y": int(cell_y),
+                "x": int(base_x + cell_x * token_width),
+                "y": int(base_y + cell_y * token_width),
+                "token_width": int(token_width),
+                "token_height": int(token_width),
+            }
+        )
+    return rows
+
+
+def run_origin_patch(model, patches, coords, args: argparse.Namespace, device):
+    import numpy as np
+    import torch
+
+    captures, handles = _origin_patch_hooks(model, args)
+    amp_enabled = args.apex and device.type == "cuda"
+    try:
+        with torch.no_grad():
+            inputs = patches.unsqueeze(0).to(device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                _ = model(inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if not captures:
+        raise RuntimeError("Could not capture origin_patch embeddings from MIL aggregators.")
+
+    feature_chunks = []
+    token_rows = []
+    target_dtype = np.float16 if args.dtype == "float16" else np.float32
+    scales_to_export = [scale for scale in args.scales if scale in captures]
+    if not scales_to_export:
+        scales_to_export = list(captures.keys())
+
+    for scale in scales_to_export:
+        if scale not in captures:
+            continue
+        tensor = captures[scale]
+        if tensor.ndim != 3 or tensor.size(0) != 1:
+            raise RuntimeError(
+                f"Expected captured origin_patch tensor for scale={scale} to have "
+                f"shape [1, N, D], got {tuple(tensor.shape)}."
+            )
+        scale_features = tensor.squeeze(0).numpy().astype(target_dtype, copy=False)
+        feature_chunks.append(scale_features)
+        token_rows.extend(
+            _origin_patch_token_rows(
+                coords=coords,
+                scale=scale,
+                num_tokens=scale_features.shape[0],
+                args=args,
+            )
+        )
+
+    if not feature_chunks:
+        raise RuntimeError("No origin_patch feature chunks were captured.")
+
+    features = np.concatenate(feature_chunks, axis=0)
+    if len(token_rows) != int(features.shape[0]):
+        raise RuntimeError(
+            f"origin_patch metadata row count mismatch: {len(token_rows)} rows vs "
+            f"{features.shape[0]} embeddings."
+        )
+    return features, token_rows
 
 
 def build_metadata_row(
@@ -598,6 +772,7 @@ def build_metadata_row(
     padding,
     embedding_start,
     original_num_patches,
+    origin_prob=None,
 ):
     metadata_row = dict(row)
     embedding_count = int(features.shape[0])
@@ -620,11 +795,18 @@ def build_metadata_row(
     metadata_row["padding_right"] = int(padding[1])
     metadata_row["padding_top"] = int(padding[2])
     metadata_row["padding_bottom"] = int(padding[3])
+    if origin_prob is not None:
+        prob = np.asarray(origin_prob, dtype=np.float32).reshape(-1)
+        if prob.shape[0] >= 2:
+            label_value = int(row[args.label])
+            metadata_row["origin_prediction_score"] = float(prob[1])
+            metadata_row["origin_predicted_class"] = int(np.argmax(prob))
+            metadata_row["origin_true_class_score"] = float(prob[label_value])
     return metadata_row
 
 
 def maybe_collect_patch_preview(preview_items, args, row, split_name, sample_key, features, coords, image_path):
-    if args.embedding_level != "patch_encoder":
+    if args.embedding_level not in {"patch_encoder", "origin_patch"}:
         return
     if args.preview_samples <= 0 or len(preview_items) >= args.preview_samples:
         return
@@ -703,6 +885,167 @@ def save_patch_preview(out_dir, preview_items):
     return preview_npz_path, preview_csv_path
 
 
+def _prototype_class_name(class_idx):
+    return "negative" if int(class_idx) == 0 else "positive"
+
+
+def _prototype_sort_key(df):
+    correct = (
+        df["origin_predicted_class"].astype(int).to_numpy()
+        == df["label"].astype(int).to_numpy()
+        if "origin_predicted_class" in df.columns
+        else np.zeros(len(df), dtype=bool)
+    )
+    source_index = (
+        df["source_index"].astype(int).to_numpy()
+        if "source_index" in df.columns
+        else np.arange(len(df), dtype=int)
+    )
+    return np.lexsort(
+        (
+            source_index,
+            -df["selection_score"].astype(float).to_numpy(),
+            -correct.astype(int),
+        )
+    )
+
+
+def _copy_prototype_image(row, args, class_idx, rank_idx):
+    source_path = Path(str(row["image_path"]))
+    if not source_path.exists():
+        raise FileNotFoundError(f"Prototype source image not found: {source_path}")
+
+    class_dir = args.out_dir / "prototype_images" / _prototype_class_name(class_idx)
+    class_dir.mkdir(parents=True, exist_ok=True)
+    suffix = source_path.suffix or ".png"
+    filename = (
+        f"c{class_idx}_p{rank_idx:02d}_"
+        f"patient-{sanitize_key(row.get('patient_id', 'unknown'))}_"
+        f"image-{sanitize_key(row.get('image_id', 'unknown'))}{suffix}"
+    )
+    target_path = class_dir / filename
+    shutil.copy2(source_path, target_path)
+    return target_path
+
+
+def save_embedding_prototype_bank(args, metadata_df, embeddings):
+    import pandas as pd
+
+    if args.embedding_level != "bag_origin" or args.prototype_k <= 0:
+        return None, None, None
+    if metadata_df.empty:
+        return None, None, None
+    required_cols = {
+        "origin_prediction_score",
+        "origin_predicted_class",
+        "origin_true_class_score",
+        "embedding_start",
+        "embedding_end",
+        "label",
+        "export_split",
+    }
+    missing = sorted(required_cols.difference(metadata_df.columns))
+    if missing:
+        raise RuntimeError(
+            "Cannot build prototype bank because metadata is missing columns: "
+            + ", ".join(missing)
+        )
+
+    if args.prototype_split == "train":
+        candidate_df = metadata_df[metadata_df["export_split"] == "train"].copy()
+    elif args.prototype_split == "train_val":
+        candidate_df = metadata_df[metadata_df["export_split"].isin(["train", "val"])].copy()
+    else:
+        candidate_df = metadata_df.copy()
+
+    if candidate_df.empty:
+        raise RuntimeError(f"No rows available for prototype selection with split={args.prototype_split}.")
+
+    prototype_vectors = []
+    bank_rows = []
+    for class_idx in [0, 1]:
+        class_df = candidate_df[candidate_df["label"].astype(int) == class_idx].copy()
+        if class_df.empty:
+            raise RuntimeError(f"No class {class_idx} rows available for prototype selection.")
+        if class_idx == 0:
+            class_df["selection_score"] = 1.0 - class_df["origin_prediction_score"].astype(float)
+        else:
+            class_df["selection_score"] = class_df["origin_prediction_score"].astype(float)
+        class_df["selection_class"] = int(class_idx)
+
+        ordered_positions = _prototype_sort_key(class_df)
+        ordered_df = class_df.iloc[ordered_positions].reset_index(drop=True)
+        if len(ordered_df) < args.prototype_k:
+            print(
+                f"[WARN] class {class_idx} has only {len(ordered_df)} candidates; "
+                f"repeating rows to fill {args.prototype_k} prototypes."
+            )
+
+        for rank_idx in range(args.prototype_k):
+            row = ordered_df.iloc[rank_idx % len(ordered_df)].to_dict()
+            start = int(row["embedding_start"])
+            end = int(row["embedding_end"])
+            if end - start != 1:
+                raise RuntimeError(
+                    "bag_origin prototype selection expects exactly one embedding row per image; "
+                    f"got {end - start} for sample_key={row.get('sample_key')}."
+                )
+
+            copied_path = _copy_prototype_image(row, args, class_idx, rank_idx)
+            prototype_vectors.append(np.asarray(embeddings[start], dtype=np.float32))
+            bank_rows.append(
+                {
+                    "head_name": "edl_head",
+                    "prototype_global_idx": int(class_idx * args.prototype_k + rank_idx),
+                    "prototype_class": int(class_idx),
+                    "prototype_rank": int(rank_idx),
+                    "prototype_id": f"c{class_idx}_p{rank_idx}",
+                    "source_patient_id": str(row.get("patient_id", "")),
+                    "source_image_id": str(row.get("image_id", "")),
+                    "source_label": int(row["label"]),
+                    "source_prediction_score": float(row["origin_prediction_score"]),
+                    "source_true_class_score": float(row["origin_true_class_score"]),
+                    "source_selection_score": float(row["selection_score"]),
+                    "source_selection_class": int(row["selection_class"]),
+                    "source_predicted_class": int(row["origin_predicted_class"]),
+                    "source_correct": bool(int(row["origin_predicted_class"]) == int(row["label"])),
+                    "source_split": str(row["export_split"]),
+                    "source_sample_key": str(row.get("sample_key", "")),
+                    "source_index": int(row.get("source_index", -1)),
+                    "embedding_file": "embeddings.npy",
+                    "embedding_start": start,
+                    "embedding_end": end,
+                    "embedding_row": start,
+                    "image_path": str(row["image_path"]),
+                    "prototype_image_path": str(copied_path),
+                    "selection_rank": int(rank_idx),
+                    "selection_method": "embedding_best_model",
+                }
+            )
+
+    prototype_bank_df = pd.DataFrame(bank_rows)
+    prototype_bank_path = args.out_dir / "prototype_bank.csv"
+    prototype_bank_df.to_csv(prototype_bank_path, index=False)
+
+    prototype_npz_path = args.out_dir / "prototype_bank.npz"
+    prototype_array = np.asarray(prototype_vectors, dtype=np.float32).reshape(
+        2,
+        args.prototype_k,
+        int(embeddings.shape[1]),
+    )
+    np.savez_compressed(
+        prototype_npz_path,
+        prototypes=prototype_array,
+        prototype_class=prototype_bank_df["prototype_class"].to_numpy(dtype=np.int64),
+        prototype_rank=prototype_bank_df["prototype_rank"].to_numpy(dtype=np.int64),
+        embedding_row=prototype_bank_df["embedding_row"].to_numpy(dtype=np.int64),
+        source_patient_id=prototype_bank_df["source_patient_id"].astype(str).to_numpy(),
+        source_image_id=prototype_bank_df["source_image_id"].astype(str).to_numpy(),
+        prototype_image_path=prototype_bank_df["prototype_image_path"].astype(str).to_numpy(),
+    )
+    return prototype_bank_path, prototype_npz_path, args.out_dir / "prototype_images"
+
+
 def build_patch_metadata_rows(row, split_name, sample_key, coords, embedding_start, image_path):
     patient_id = str(row.get("patient_id", ""))
     image_id = str(row.get("image_id", ""))
@@ -719,6 +1062,34 @@ def build_patch_metadata_rows(row, split_name, sample_key, coords, embedding_sta
                 "y": int(coord[1]),
                 "embedding_file": "embeddings.npy",
                 "embedding_row": int(embedding_start + patch_idx),
+                "image_path": str(image_path),
+            }
+        )
+    return rows
+
+
+def build_origin_patch_metadata_rows(row, split_name, sample_key, token_rows, embedding_start, image_path):
+    patient_id = str(row.get("patient_id", ""))
+    image_id = str(row.get("image_id", ""))
+    rows = []
+    for offset, token_row in enumerate(token_rows):
+        rows.append(
+            {
+                "export_split": split_name,
+                "patient_id": patient_id,
+                "image_id": image_id,
+                "sample_key": sample_key,
+                "patch_idx": int(token_row["patch_idx"]),
+                "token_idx": int(token_row["token_idx"]),
+                "scale": int(token_row["scale"]),
+                "cell_x": int(token_row["cell_x"]),
+                "cell_y": int(token_row["cell_y"]),
+                "x": int(token_row["x"]),
+                "y": int(token_row["y"]),
+                "token_width": int(token_row["token_width"]),
+                "token_height": int(token_row["token_height"]),
+                "embedding_file": "embeddings.npy",
+                "embedding_row": int(embedding_start + offset),
                 "image_path": str(image_path),
             }
         )
@@ -791,6 +1162,8 @@ def export_embeddings(args: argparse.Namespace):
             sample_key = make_sample_key(row, used_keys)
             original_num_patches = int(patches.shape[0])
 
+            token_rows = None
+            origin_prob = None
             if args.embedding_level == "patch_encoder":
                 features = run_patch_encoder(image_encoder, patches, args, device)
                 if int(features.shape[0]) != int(coords.shape[0]):
@@ -799,8 +1172,16 @@ def export_embeddings(args: argparse.Namespace):
                         f"{features.shape[0]} embeddings vs {coords.shape[0]} coords "
                         f"for patient_id={row.get('patient_id')}, image_id={row.get('image_id')}."
                     )
+                preview_coords = coords
+            elif args.embedding_level == "origin_patch":
+                features, token_rows = run_origin_patch(origin_model, patches, coords, args, device)
+                preview_coords = np.asarray(
+                    [[token_row["x"], token_row["y"]] for token_row in token_rows],
+                    dtype=np.int32,
+                )
             else:
-                features = run_bag_origin(origin_model, patches, args, device)
+                features, origin_prob = run_bag_origin(origin_model, patches, args, device)
+                preview_coords = coords
 
             embedding_dims.add(int(features.shape[-1]))
             maybe_collect_patch_preview(
@@ -810,7 +1191,7 @@ def export_embeddings(args: argparse.Namespace):
                 split_name,
                 sample_key,
                 features,
-                coords,
+                preview_coords,
                 sample["image_path"],
             )
             if args.embedding_level == "patch_encoder":
@@ -820,6 +1201,17 @@ def export_embeddings(args: argparse.Namespace):
                         split_name=split_name,
                         sample_key=sample_key,
                         coords=coords,
+                        embedding_start=embedding_offset,
+                        image_path=sample["image_path"],
+                    )
+                )
+            elif args.embedding_level == "origin_patch":
+                patch_metadata_rows.extend(
+                    build_origin_patch_metadata_rows(
+                        row=row,
+                        split_name=split_name,
+                        sample_key=sample_key,
+                        token_rows=token_rows,
                         embedding_start=embedding_offset,
                         image_path=sample["image_path"],
                     )
@@ -836,6 +1228,7 @@ def export_embeddings(args: argparse.Namespace):
                     padding=padding,
                     embedding_start=embedding_offset,
                     original_num_patches=original_num_patches,
+                    origin_prob=origin_prob,
                 )
             )
             embedding_chunks.append(features)
@@ -853,6 +1246,11 @@ def export_embeddings(args: argparse.Namespace):
     metadata_df = pd.DataFrame(metadata_rows)
     metadata_path = args.out_dir / "metadata.csv"
     metadata_df.to_csv(metadata_path, index=False)
+    prototype_bank_path, prototype_npz_path, prototype_image_dir = save_embedding_prototype_bank(
+        args,
+        metadata_df,
+        embeddings,
+    )
     patch_metadata_path = None
     if patch_metadata_rows:
         patch_metadata_path = args.out_dir / "patch_metadata.csv"
@@ -875,6 +1273,11 @@ def export_embeddings(args: argparse.Namespace):
         "patch_metadata_file": str(patch_metadata_path) if patch_metadata_path else None,
         "patch_preview_file": str(preview_paths[0]) if preview_paths else None,
         "patch_preview_metadata_file": str(preview_paths[1]) if preview_paths else None,
+        "prototype_k": int(args.prototype_k),
+        "prototype_split": args.prototype_split,
+        "prototype_bank_file": str(prototype_bank_path) if prototype_bank_path else None,
+        "prototype_bank_npz_file": str(prototype_npz_path) if prototype_npz_path else None,
+        "prototype_image_dir": str(prototype_image_dir) if prototype_image_dir else None,
         "embedding_shape": list(embeddings.shape),
         "embedding_dtype": str(embeddings.dtype),
         "layout": {
@@ -884,9 +1287,14 @@ def export_embeddings(args: argparse.Namespace):
                 "to slice that sample from embeddings.npy."
             ),
             "patch_metadata.csv": (
-                "One row per patch for patch_encoder exports. embedding_row points "
-                "to that patch vector in embeddings.npy."
+                "One row per exported patch/token for patch_encoder or origin_patch exports. "
+                "embedding_row points to that vector in embeddings.npy."
             ),
+            "prototype_bank.csv": (
+                "For bag_origin exports with prototype_k > 0, one row per selected real-image "
+                "prototype. embedding_row points to the prototype vector in embeddings.npy."
+            ),
+            "prototype_images/": "Copied source images grouped into negative/ and positive/ prototype folders.",
             "coords": "JSON list stored per metadata row; one [x, y] coordinate per original patch.",
         },
     }
@@ -900,6 +1308,10 @@ def export_embeddings(args: argparse.Namespace):
     if preview_paths:
         print(f"[DONE] Patch preview saved to: {preview_paths[0]}")
         print(f"[DONE] Patch preview metadata saved to: {preview_paths[1]}")
+    if prototype_bank_path:
+        print(f"[DONE] Prototype bank saved to: {prototype_bank_path}")
+        print(f"[DONE] Prototype bank NPZ saved to: {prototype_npz_path}")
+        print(f"[DONE] Prototype images saved under: {prototype_image_dir}")
     print(f"[DONE] Manifest saved to: {args.out_dir / 'manifest.json'}")
     for split_name in ["train", "val", "test"]:
         print(f"[DONE] {split_name}: {split_counts.get(split_name, 0)} samples")
