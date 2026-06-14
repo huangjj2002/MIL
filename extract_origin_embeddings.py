@@ -109,6 +109,56 @@ def parse_args() -> argparse.Namespace:
         choices=["train", "train_val", "all"],
         help="Rows eligible for prototype selection during bag_origin export.",
     )
+    parser.add_argument(
+        "--prototype-normal-views-only",
+        "--prototype_normal_views_only",
+        dest="prototype_normal_views_only",
+        action="store_true",
+        default=False,
+        help=(
+            "When selecting bag_origin prototypes, keep only standard mammography "
+            "views when a view-like metadata column is available."
+        ),
+    )
+    parser.add_argument(
+        "--prototype-view-col",
+        "--prototype_view_col",
+        dest="prototype_view_col",
+        default=None,
+        type=str,
+        help="Optional metadata column used to identify CC/MLO views for prototype selection.",
+    )
+    parser.add_argument(
+        "--prototype-allowed-views",
+        "--prototype_allowed_views",
+        dest="prototype_allowed_views",
+        nargs="*",
+        default=["CC", "MLO", "LCC", "RCC", "LMLO", "RMLO"],
+        help="Allowed view labels for --prototype-normal-views-only.",
+    )
+    parser.add_argument(
+        "--prototype-exclude-view-keywords",
+        "--prototype_exclude_view_keywords",
+        dest="prototype_exclude_view_keywords",
+        nargs="*",
+        default=[
+            "spot",
+            "magnification",
+            "mag",
+            "compression",
+            "implant",
+            "displaced",
+            "rolled",
+            "tangent",
+            "tangential",
+            "cleavage",
+            "axillary",
+        ],
+        help=(
+            "Case-insensitive metadata keywords excluded from prototype selection "
+            "when --prototype-normal-views-only is enabled."
+        ),
+    )
 
     # Image and encoder settings
     parser.add_argument("--arch", default="upmc_breast_clip_det_b5_period_n_ft", type=str)
@@ -910,6 +960,103 @@ def _prototype_sort_key(df):
     )
 
 
+def _normalize_view_text(value):
+    return re.sub(r"[^A-Z0-9]+", "", str(value).upper())
+
+
+def _find_prototype_view_column(df, args):
+    if args.prototype_view_col:
+        if args.prototype_view_col not in df.columns:
+            raise ValueError(
+                f"--prototype-view-col {args.prototype_view_col!r} was not found in metadata columns."
+            )
+        return args.prototype_view_col
+
+    preferred = [
+        "view_position",
+        "ViewPosition",
+        "view",
+        "View",
+        "view_name",
+        "image_view",
+        "laterality_view",
+        "projection",
+        "SeriesDescription",
+        "series_description",
+        "ProtocolName",
+        "protocol_name",
+    ]
+    lower_to_original = {str(col).lower(): col for col in df.columns}
+    for col in preferred:
+        if col in df.columns:
+            return col
+        if col.lower() in lower_to_original:
+            return lower_to_original[col.lower()]
+
+    for col in df.columns:
+        name = str(col).lower()
+        if "view" in name or "projection" in name or "series" in name or "protocol" in name:
+            return col
+    return None
+
+
+def _filter_prototype_normal_views(candidate_df, args):
+    if not args.prototype_normal_views_only:
+        return candidate_df
+
+    view_col = _find_prototype_view_column(candidate_df, args)
+    if view_col is None:
+        print(
+            "[WARN] --prototype-normal-views-only was set, but no view-like metadata "
+            "column was found. Prototype selection will use all candidate rows."
+        )
+        return candidate_df
+
+    allowed_views = {
+        _normalize_view_text(view)
+        for view in args.prototype_allowed_views
+        if str(view).strip()
+    }
+    exclude_keywords = [
+        str(keyword).strip().lower()
+        for keyword in args.prototype_exclude_view_keywords
+        if str(keyword).strip()
+    ]
+
+    text_cols = [
+        col for col in candidate_df.columns
+        if candidate_df[col].dtype == object or "view" in str(col).lower()
+        or "series" in str(col).lower() or "protocol" in str(col).lower()
+    ]
+    if view_col not in text_cols:
+        text_cols.append(view_col)
+
+    keep_mask = []
+    for _, row in candidate_df.iterrows():
+        row_text = " ".join(str(row.get(col, "")) for col in text_cols).lower()
+        has_excluded_keyword = any(keyword in row_text for keyword in exclude_keywords)
+        normalized_view = _normalize_view_text(row.get(view_col, ""))
+        has_allowed_view = (
+            normalized_view in allowed_views
+            or any(normalized_view.endswith(view) for view in allowed_views)
+            or any(view in normalized_view for view in allowed_views if len(view) >= 3)
+        )
+        keep_mask.append(has_allowed_view and not has_excluded_keyword)
+
+    filtered = candidate_df[np.asarray(keep_mask, dtype=bool)].copy()
+    print(
+        f"[INFO] Prototype normal-view filter using column {view_col!r}: "
+        f"{len(filtered)}/{len(candidate_df)} candidates kept."
+    )
+    if filtered.empty:
+        raise RuntimeError(
+            "Prototype normal-view filter removed all candidate rows. "
+            "Check --prototype-view-col / --prototype-allowed-views / "
+            "--prototype-exclude-view-keywords."
+        )
+    return filtered
+
+
 def _copy_prototype_image(row, args, class_idx, rank_idx):
     source_path = Path(str(row["image_path"]))
     if not source_path.exists():
@@ -960,6 +1107,7 @@ def save_embedding_prototype_bank(args, metadata_df, embeddings):
 
     if candidate_df.empty:
         raise RuntimeError(f"No rows available for prototype selection with split={args.prototype_split}.")
+    candidate_df = _filter_prototype_normal_views(candidate_df, args)
 
     prototype_vectors = []
     bank_rows = []
