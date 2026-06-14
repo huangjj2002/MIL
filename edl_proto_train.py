@@ -722,6 +722,7 @@ def expected_proto_columns(args):
                 f"{prefix}_evidence",
                 f"{prefix}_mass",
                 f"{prefix}_similarity",
+                f"{prefix}_distance",
             ])
     return columns
 
@@ -733,6 +734,7 @@ def _append_proto_batch(proto_buffers, edl_out):
     top_idx = edl_out["topk_proto_idx"].detach().cpu().numpy()
     top_evidence = edl_out["topk_proto_evidence"].detach().cpu().numpy()
     top_similarity = edl_out["topk_proto_similarity"].detach().cpu().numpy()
+    top_distances = edl_out["topk_proto_distances"].detach().cpu().numpy()
 
     for class_idx in range(top_idx.shape[1]):
         for rank_idx in range(top_idx.shape[2]):
@@ -741,6 +743,109 @@ def _append_proto_batch(proto_buffers, edl_out):
             proto_buffers.setdefault(f"{prefix}_evidence", []).append(top_evidence[:, class_idx, rank_idx])
             proto_buffers.setdefault(f"{prefix}_mass", []).append(top_evidence[:, class_idx, rank_idx])
             proto_buffers.setdefault(f"{prefix}_similarity", []).append(top_similarity[:, class_idx, rank_idx])
+            proto_buffers.setdefault(f"{prefix}_distance", []).append(top_distances[:, class_idx, rank_idx])
+
+
+INTERPRETABILITY_TENSOR_KEYS = [
+    "prototype_mass",
+    "prototype_similarity",
+    "prototype_distances",
+    "topk_proto_idx",
+    "topk_proto_mass",
+    "topk_proto_similarity",
+    "topk_proto_distances",
+]
+
+
+def _append_interpretability_batch(interpretability_buffers, edl_out):
+    for key in INTERPRETABILITY_TENSOR_KEYS:
+        if key in edl_out:
+            interpretability_buffers.setdefault(key, []).append(
+                edl_out[key].detach().cpu().numpy()
+            )
+
+
+def _string_array(values):
+    return np.asarray(["" if value is None else str(value) for value in values], dtype=str)
+
+
+def _concat_result_field(results_by_split, key, dtype=None):
+    chunks = []
+    for _, sample_results in results_by_split:
+        if key not in sample_results:
+            continue
+        chunks.append(np.asarray(sample_results[key]))
+    if not chunks:
+        return None
+
+    values = np.concatenate(chunks, axis=0)
+    if dtype is not None:
+        values = values.astype(dtype, copy=False)
+    return values
+
+
+def _extract_primary_prototype_state(model):
+    if not hasattr(model, "prototype_heads"):
+        return {}
+
+    heads = model.prototype_heads()
+    if not heads:
+        return {}
+
+    head_name = "edl_head" if "edl_head" in heads else next(iter(heads.keys()))
+    head = heads[head_name]
+    arrays = {
+        "prototype_head": np.asarray(head_name),
+        "prototypes": head.prototypes.detach().cpu().numpy(),
+    }
+
+    activation = getattr(getattr(head, "ds_module", None), "ds1_activate", None)
+    if activation is not None:
+        reliability = torch.sigmoid(activation.xi).detach().cpu()
+        gamma = activation.eta.detach().cpu().pow(2)
+        shape = (head.num_classes, head.prototypes_per_class)
+        arrays["prototype_reliability"] = reliability.view(shape).numpy()
+        arrays["prototype_gamma"] = gamma.view(shape).numpy()
+
+    return arrays
+
+
+def save_dst_proto_interpretability_npz(output_path, model, results_by_split):
+    results_by_split = [
+        (split_name, sample_results)
+        for split_name, sample_results in results_by_split
+        if sample_results is not None and len(sample_results.get("label", [])) > 0
+    ]
+    if not results_by_split:
+        return None
+
+    split_values = []
+    for split_name, sample_results in results_by_split:
+        split_values.extend([split_name] * len(sample_results["label"]))
+
+    arrays = {
+        "patient_id": _string_array(_concat_result_field(results_by_split, "patient_id")),
+        "image_id": _string_array(_concat_result_field(results_by_split, "image_id")),
+        "split": _string_array(split_values),
+        "label": _concat_result_field(results_by_split, "label", dtype=np.int64),
+        "prediction_score": _concat_result_field(results_by_split, "score", dtype=np.float32),
+        "predicted_class": _concat_result_field(results_by_split, "pred", dtype=np.int64),
+        "dst_mass": _concat_result_field(results_by_split, "dst_mass", dtype=np.float32),
+        "uncertainty": _concat_result_field(results_by_split, "uncertainty", dtype=np.float32),
+    }
+
+    for key in INTERPRETABILITY_TENSOR_KEYS:
+        values = _concat_result_field(results_by_split, key)
+        if values is not None:
+            arrays[key] = values
+
+    arrays.update(_extract_primary_prototype_state(model))
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, **arrays)
+    print(f"[DST_PROTO] Interpretability NPZ saved: {output_path}")
+    return output_path
 
 
 @torch.no_grad()
@@ -754,6 +859,7 @@ def edl_proto_predict(loader, model, args, device, desc="DST_PROTO predict"):
     uncertainty_list = []
     mass_list = []
     proto_buffers = {}
+    interpretability_buffers = {}
     sample_patient_ids = []
     sample_image_ids = []
 
@@ -787,6 +893,7 @@ def edl_proto_predict(loader, model, args, device, desc="DST_PROTO predict"):
         uncertainty_list.append(uncertainty.numpy())
         mass_list.append(mass.numpy())
         _append_proto_batch(proto_buffers, edl_out)
+        _append_interpretability_batch(interpretability_buffers, edl_out)
 
     mass_array = np.concatenate(mass_list)
     results = {
@@ -796,6 +903,7 @@ def edl_proto_predict(loader, model, args, device, desc="DST_PROTO predict"):
         "score": np.concatenate(probs_list).tolist(),
         "pred": np.concatenate(preds_list).tolist(),
         "uncertainty": np.concatenate(uncertainty_list).tolist(),
+        "dst_mass": mass_array,
         "mass_0": mass_array[:, 0].tolist(),
         "mass_1": mass_array[:, 1].tolist(),
         "mass_omega": mass_array[:, 2].tolist(),
@@ -803,6 +911,9 @@ def edl_proto_predict(loader, model, args, device, desc="DST_PROTO predict"):
 
     for key, chunks in proto_buffers.items():
         results[key] = np.concatenate(chunks).tolist()
+
+    for key, chunks in interpretability_buffers.items():
+        results[key] = np.concatenate(chunks, axis=0)
 
     return results
 
@@ -1017,6 +1128,7 @@ def do_edl_proto_training(args, device):
         model.eval()
 
         all_split_dfs = []
+        fold_interpretability_results = []
         split_specs = [("train", train_df), ("val", val_df), ("test", test_df)]
         for split_name, split_df in split_specs:
             if split_df is None or len(split_df) == 0:
@@ -1030,6 +1142,7 @@ def do_edl_proto_training(args, device):
                 device,
                 desc=f"DST_PROTO {split_name} predict",
             )
+            fold_interpretability_results.append((split_name, sample_results))
             pred_df = build_prediction_df(split_df, sample_results, split_name, fold, args)
             all_split_dfs.append(pred_df)
 
@@ -1044,6 +1157,11 @@ def do_edl_proto_training(args, device):
                 index=False,
             )
             print(f"Saved fold {fold} Prototype-DST predictions: {len(fold_pred_df)} samples")
+            save_dst_proto_interpretability_npz(
+                path_results_fold / f"{args.dataset}_dst_proto_interpretability_fold_{fold}.npz",
+                model,
+                fold_interpretability_results,
+            )
 
         del model
         clear_memory()

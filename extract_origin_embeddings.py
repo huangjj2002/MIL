@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 
 RGB_ARCHES = {
     "upmc_breast_clip_det_b5_period_n_ft",
@@ -112,6 +114,28 @@ def parse_args() -> argparse.Namespace:
 
     # Save format
     parser.add_argument("--dtype", default="float16", choices=["float16", "float32"])
+    parser.add_argument(
+        "--preview-samples",
+        "--preview_samples",
+        dest="preview_samples",
+        default=0,
+        type=int,
+        help=(
+            "When exporting patch_encoder embeddings, also save a small "
+            "patch_embedding_preview.npz/csv for the first N samples."
+        ),
+    )
+    parser.add_argument(
+        "--preview-max-patches",
+        "--preview_max_patches",
+        dest="preview_max_patches",
+        default=0,
+        type=int,
+        help=(
+            "Maximum patches per preview sample. Use 0 to keep all patches "
+            "for previewed samples."
+        ),
+    )
 
     # Embedding level
     parser.add_argument(
@@ -200,6 +224,10 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--encoder-batch-size must be positive.")
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be positive when provided.")
+    if args.preview_samples < 0:
+        raise ValueError("--preview-samples must be non-negative.")
+    if args.preview_max_patches < 0:
+        raise ValueError("--preview-max-patches must be non-negative.")
     if args.embedding_level == "bag_origin" and args.origin_checkpoint is None:
         raise ValueError("--origin-checkpoint is required when --embedding-level bag_origin.")
     if args.embedding_level == "bag_origin" and args.multi_scale_model == "msp":
@@ -595,6 +623,108 @@ def build_metadata_row(
     return metadata_row
 
 
+def maybe_collect_patch_preview(preview_items, args, row, split_name, sample_key, features, coords, image_path):
+    if args.embedding_level != "patch_encoder":
+        return
+    if args.preview_samples <= 0 or len(preview_items) >= args.preview_samples:
+        return
+
+    keep_count = int(features.shape[0])
+    if args.preview_max_patches > 0:
+        keep_count = min(keep_count, args.preview_max_patches)
+
+    preview_items.append(
+        {
+            "split": split_name,
+            "sample_key": sample_key,
+            "patient_id": str(row.get("patient_id", "")),
+            "image_id": str(row.get("image_id", "")),
+            "image_path": str(image_path),
+            "patch_embeddings": features[:keep_count].copy(),
+            "patch_coords": coords[:keep_count].astype(np.int32, copy=True),
+            "total_patches": int(features.shape[0]),
+            "preview_patches": int(keep_count),
+        }
+    )
+
+
+def save_patch_preview(out_dir, preview_items):
+    if not preview_items:
+        return None
+
+    patch_embeddings = []
+    patch_coords = []
+    patch_sample_index = []
+    rows = []
+    patch_offset = 0
+
+    for sample_index, item in enumerate(preview_items):
+        embeddings = item["patch_embeddings"]
+        coords = item["patch_coords"]
+        patch_count = int(embeddings.shape[0])
+        patch_embeddings.append(embeddings)
+        patch_coords.append(coords)
+        patch_sample_index.append(
+            np.full(patch_count, sample_index, dtype=np.int32)
+        )
+        rows.append(
+            {
+                "preview_sample_index": sample_index,
+                "split": item["split"],
+                "patient_id": item["patient_id"],
+                "image_id": item["image_id"],
+                "sample_key": item["sample_key"],
+                "image_path": item["image_path"],
+                "total_patches": item["total_patches"],
+                "preview_patches": item["preview_patches"],
+                "preview_patch_start": patch_offset,
+                "preview_patch_end": patch_offset + patch_count,
+            }
+        )
+        patch_offset += patch_count
+
+    preview_npz_path = out_dir / "patch_embedding_preview.npz"
+    preview_csv_path = out_dir / "patch_embedding_preview.csv"
+    np.savez_compressed(
+        preview_npz_path,
+        patch_embeddings=np.concatenate(patch_embeddings, axis=0),
+        patch_coords=np.concatenate(patch_coords, axis=0),
+        patch_sample_index=np.concatenate(patch_sample_index, axis=0),
+        split=np.asarray([item["split"] for item in preview_items], dtype=str),
+        patient_id=np.asarray([item["patient_id"] for item in preview_items], dtype=str),
+        image_id=np.asarray([item["image_id"] for item in preview_items], dtype=str),
+        sample_key=np.asarray([item["sample_key"] for item in preview_items], dtype=str),
+        image_path=np.asarray([item["image_path"] for item in preview_items], dtype=str),
+    )
+
+    import pandas as pd
+
+    pd.DataFrame(rows).to_csv(preview_csv_path, index=False)
+    return preview_npz_path, preview_csv_path
+
+
+def build_patch_metadata_rows(row, split_name, sample_key, coords, embedding_start, image_path):
+    patient_id = str(row.get("patient_id", ""))
+    image_id = str(row.get("image_id", ""))
+    rows = []
+    for patch_idx, coord in enumerate(coords.astype(int).tolist()):
+        rows.append(
+            {
+                "export_split": split_name,
+                "patient_id": patient_id,
+                "image_id": image_id,
+                "sample_key": sample_key,
+                "patch_idx": patch_idx,
+                "x": int(coord[0]),
+                "y": int(coord[1]),
+                "embedding_file": "embeddings.npy",
+                "embedding_row": int(embedding_start + patch_idx),
+                "image_path": str(image_path),
+            }
+        )
+    return rows
+
+
 def export_embeddings(args: argparse.Namespace):
     import numpy as np
     import pandas as pd
@@ -636,6 +766,8 @@ def export_embeddings(args: argparse.Namespace):
     split_counts = {}
     embedding_dims = set()
     embedding_offset = 0
+    patch_preview_items = []
+    patch_metadata_rows = []
 
     for split_name, split_df in split_dfs.items():
         split_counts[split_name] = int(len(split_df))
@@ -661,10 +793,37 @@ def export_embeddings(args: argparse.Namespace):
 
             if args.embedding_level == "patch_encoder":
                 features = run_patch_encoder(image_encoder, patches, args, device)
+                if int(features.shape[0]) != int(coords.shape[0]):
+                    raise RuntimeError(
+                        "Patch embedding row count does not match coordinate count: "
+                        f"{features.shape[0]} embeddings vs {coords.shape[0]} coords "
+                        f"for patient_id={row.get('patient_id')}, image_id={row.get('image_id')}."
+                    )
             else:
                 features = run_bag_origin(origin_model, patches, args, device)
 
             embedding_dims.add(int(features.shape[-1]))
+            maybe_collect_patch_preview(
+                patch_preview_items,
+                args,
+                row,
+                split_name,
+                sample_key,
+                features,
+                coords,
+                sample["image_path"],
+            )
+            if args.embedding_level == "patch_encoder":
+                patch_metadata_rows.extend(
+                    build_patch_metadata_rows(
+                        row=row,
+                        split_name=split_name,
+                        sample_key=sample_key,
+                        coords=coords,
+                        embedding_start=embedding_offset,
+                        image_path=sample["image_path"],
+                    )
+                )
             metadata_rows.append(
                 build_metadata_row(
                     row=row,
@@ -694,6 +853,11 @@ def export_embeddings(args: argparse.Namespace):
     metadata_df = pd.DataFrame(metadata_rows)
     metadata_path = args.out_dir / "metadata.csv"
     metadata_df.to_csv(metadata_path, index=False)
+    patch_metadata_path = None
+    if patch_metadata_rows:
+        patch_metadata_path = args.out_dir / "patch_metadata.csv"
+        pd.DataFrame(patch_metadata_rows).to_csv(patch_metadata_path, index=False)
+    preview_paths = save_patch_preview(args.out_dir, patch_preview_items)
 
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -708,6 +872,9 @@ def export_embeddings(args: argparse.Namespace):
         "embedding_dims": sorted(embedding_dims),
         "embedding_file": str(embeddings_path),
         "metadata_file": str(metadata_path),
+        "patch_metadata_file": str(patch_metadata_path) if patch_metadata_path else None,
+        "patch_preview_file": str(preview_paths[0]) if preview_paths else None,
+        "patch_preview_metadata_file": str(preview_paths[1]) if preview_paths else None,
         "embedding_shape": list(embeddings.shape),
         "embedding_dtype": str(embeddings.dtype),
         "layout": {
@@ -715,6 +882,10 @@ def export_embeddings(args: argparse.Namespace):
             "metadata.csv": (
                 "One row per source image. Use embedding_start:embedding_end "
                 "to slice that sample from embeddings.npy."
+            ),
+            "patch_metadata.csv": (
+                "One row per patch for patch_encoder exports. embedding_row points "
+                "to that patch vector in embeddings.npy."
             ),
             "coords": "JSON list stored per metadata row; one [x, y] coordinate per original patch.",
         },
@@ -724,6 +895,11 @@ def export_embeddings(args: argparse.Namespace):
 
     print(f"[DONE] Embeddings saved to: {embeddings_path}")
     print(f"[DONE] Metadata saved to: {metadata_path}")
+    if patch_metadata_path:
+        print(f"[DONE] Patch metadata saved to: {patch_metadata_path}")
+    if preview_paths:
+        print(f"[DONE] Patch preview saved to: {preview_paths[0]}")
+        print(f"[DONE] Patch preview metadata saved to: {preview_paths[1]}")
     print(f"[DONE] Manifest saved to: {args.out_dir / 'manifest.json'}")
     for split_name in ["train", "val", "test"]:
         print(f"[DONE] {split_name}: {split_counts.get(split_name, 0)} samples")

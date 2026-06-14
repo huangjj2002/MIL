@@ -18,6 +18,7 @@ from edl_proto_train import (
     build_edl_proto_model,
     build_prediction_df,
     edl_proto_predict,
+    save_dst_proto_interpretability_npz,
 )
 from edl_test import config as base_edl_test_config
 from utils.data_split_utils import (
@@ -190,6 +191,11 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
         )
         val_result_df = build_prediction_df(val_df, val_results, "val", fold, args)
         all_dev_results.append(val_result_df)
+        save_dst_proto_interpretability_npz(
+            output_dir / f"{args.dataset}_dst_proto_interpretability_val_fold_{fold}.npz",
+            model,
+            [("val", val_results)],
+        )
 
         targs = np.array(val_results["label"])
         probs = np.array(val_results["score"])
@@ -233,6 +239,11 @@ def run_edl_proto_test(args, device, checkpoint_dir=None, output_dir=None):
             )
             test_result_df = build_prediction_df(test_df, test_results, "test", fold, args)
             test_all_fold_results.append(test_result_df)
+            save_dst_proto_interpretability_npz(
+                output_dir / f"{args.dataset}_dst_proto_interpretability_test_fold_{fold}.npz",
+                model,
+                [("test", test_results)],
+            )
 
             targs = np.array(test_results["label"])
             probs = np.array(test_results["score"])
