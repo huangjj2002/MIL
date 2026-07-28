@@ -137,6 +137,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", default=3e-4, type=float)
     parser.add_argument("--weight-decay", default=1e-4, type=float)
     parser.add_argument("--num-workers", default=4, type=int)
+    parser.add_argument(
+        "--allow-patient-overlap",
+        action="store_true",
+        help=(
+            "Exploratory-only override for known patient overlap across train/test cohorts. "
+            "The run manifest records this as invalid for leakage-free paper results."
+        ),
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
         "--trainer",
@@ -298,6 +306,7 @@ def build_command(
         "--edl_proto_init", "fold_best_scores",
         "--edl_proto_normalize", "y",
         "--edl_proto_balance_classes", "y",
+        "--edl_proto_allow_patient_overlap", "y" if getattr(args, "allow_patient_overlap", False) else "n",
         "--edl_proto_attract_weight", str(variant.attract),
         "--edl_proto_separation_weight", str(variant.separation),
         "--edl_proto_diversity_weight", str(variant.diversity),
@@ -425,6 +434,7 @@ def main() -> int:
             "lr": args.lr,
             "weight_decay": args.weight_decay,
             "weighted_BCE": True,
+            "patient_overlap_override": bool(getattr(args, "allow_patient_overlap", False)),
             "train_cohorts": args.train_cohorts,
             "test_cohorts": args.test_cohorts,
         },

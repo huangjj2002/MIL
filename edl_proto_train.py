@@ -99,6 +99,12 @@ def _add_proto_args(parser):
                         ))
     parser.add_argument("--edl_proto_balance_classes", default="y", choices=["y", "n"],
                         help="Average prototype attraction/separation by class instead of by sample.")
+    parser.add_argument("--edl_proto_allow_patient_overlap", default="n", choices=["y", "n"],
+                        help=(
+                            "Emergency exploratory override only: permit prototype-source patient IDs "
+                            "to overlap validation or held-out test patients. This invalidates leakage-free "
+                            "evaluation and is recorded in args.yaml."
+                        ))
 
 
 def _resolve_proto_margins(args):
@@ -906,10 +912,32 @@ def _select_fold_best_score_rows(
     train_patients = _patient_id_set(train_df)
     val_patients = _patient_id_set(val_df)
     test_patients = _patient_id_set(test_df)
-    if train_patients.intersection(val_patients):
-        raise ValueError("Training and validation patient IDs overlap during prototype selection.")
-    if train_patients.intersection(test_patients):
-        raise ValueError("Training and held-out test patient IDs overlap during prototype selection.")
+    allow_overlap = getattr(train_df, "attrs", {}).get("edl_proto_allow_patient_overlap", False)
+    overlap_messages = []
+    train_val_overlap = train_patients.intersection(val_patients)
+    train_test_overlap = train_patients.intersection(test_patients)
+    if train_val_overlap:
+        overlap_messages.append(
+            "training/validation="
+            f"{len(train_val_overlap)} (examples={sorted(train_val_overlap)[:5]})"
+        )
+    if train_test_overlap:
+        overlap_messages.append(
+            "training/held-out-test="
+            f"{len(train_test_overlap)} (examples={sorted(train_test_overlap)[:5]})"
+        )
+    if overlap_messages and not allow_overlap:
+        raise ValueError(
+            "Patient ID overlap during fold-safe prototype selection: "
+            + "; ".join(overlap_messages)
+            + ". Refuse to continue unless the explicit exploratory override is enabled."
+        )
+    if overlap_messages:
+        print(
+            "[DST_PROTO][WARNING] Patient-overlap override is enabled; prototype "
+            "selection is NOT leakage-free (" + "; ".join(overlap_messages) + "). "
+            "Do not use this run for paper results."
+        )
 
     train_keys = train_df[key_cols + [label_col]].copy()
     metadata = metadata_df.drop(columns=[label_col], errors="ignore").copy()
@@ -993,7 +1021,7 @@ def _select_fold_best_score_rows(
     selected_patients = set(selected_df["patient_id"].map(_normalize_sample_id))
     if not selected_patients.issubset(train_patients):
         raise AssertionError("A selected prototype did not originate from the current fold training set.")
-    if selected_patients.intersection(val_patients | test_patients):
+    if selected_patients.intersection(val_patients | test_patients) and not allow_overlap:
         raise AssertionError("A selected prototype patient appears in validation or held-out test data.")
     return selected_df
 
@@ -1009,6 +1037,14 @@ def initialize_prototypes_from_fold_best_scores(model, train_df, val_df, test_df
             "fold_best_scores requires metadata.csv and embeddings.npy under "
             f"--embedding_cache_dir; got {cache_dir}."
         )
+
+    # _select_fold_best_score_rows is intentionally dataframe-only for testing;
+    # pass the opt-in leakage override through a dataframe attribute rather than
+    # making it a default argument that could be enabled accidentally.
+    train_df = train_df.copy()
+    train_df.attrs["edl_proto_allow_patient_overlap"] = (
+        getattr(args, "edl_proto_allow_patient_overlap", "n") == "y"
+    )
 
     metadata = pd.read_csv(metadata_path, dtype={"patient_id": str, "image_id": str})
     embeddings = np.load(embeddings_path, mmap_mode="r")
