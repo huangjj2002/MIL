@@ -58,17 +58,27 @@ def _add_proto_args(parser):
     parser.add_argument("--edl_proto_topk", default=3, type=int,
                         help="Number of top prototypes exported per class.")
     parser.add_argument("--edl_proto_gamma_init", default=1.0, type=float,
-                        help="Initial distance sharpness for prototype similarity.")
+                        help=(
+                            "Initial trainable DST distance sharpness for prototype similarity; "
+                            "this is not the separation/diversity regularization margin."
+                        ))
     parser.add_argument("--edl_proto_alpha_init", default=0.0, type=float,
                         help="Initial DST prototype reliability logit.")
     parser.add_argument("--edl_proto_normalize", default="y", choices=["y", "n"],
                         help="Normalize embeddings and prototypes before distance computation.")
     parser.add_argument("--edl_proto_init", default="embedding_bank",
-                        choices=["embedding_bank", "best_samples", "kmeans", "random"],
+                        choices=[
+                            "fold_best_scores",
+                            "embedding_bank",
+                            "best_samples",
+                            "kmeans",
+                            "random",
+                        ],
                         help=(
-                            "Prototype initialization method. embedding_bank loads "
-                            "prototype_bank.csv from --embedding_cache_dir; best_samples selects "
-                            "real train samples with the highest true-class confidence per class."
+                            "Prototype initialization method. fold_best_scores selects real samples "
+                            "from the current fold's training patients using cached original-MIL "
+                            "scores; embedding_bank loads a legacy global prototype_bank.csv; "
+                            "best_samples scores the current model before training."
                         ))
     parser.add_argument("--edl_proto_attract_weight", default=0.1, type=float,
                         help="Weight for pulling samples toward same-class prototypes.")
@@ -76,16 +86,41 @@ def _add_proto_args(parser):
                         help="Weight for pushing samples away from opposite-class prototypes.")
     parser.add_argument("--edl_proto_diversity_weight", default=0.01, type=float,
                         help="Weight for keeping same-class prototypes diverse.")
-    parser.add_argument("--edl_proto_margin", default=1.0, type=float,
-                        help="Distance margin used by prototype separation/diversity losses.")
+    parser.add_argument("--edl_proto_gamma_sep", "--edl-proto-gamma-sep",
+                        default=None, type=float,
+                        help="Hinge distance margin gamma_sep used only by prototype separation loss.")
+    parser.add_argument("--edl_proto_gamma_div", "--edl-proto-gamma-div",
+                        default=None, type=float,
+                        help="Hinge distance margin gamma_div used only by prototype diversity loss.")
+    parser.add_argument("--edl_proto_margin", default=None, type=float,
+                        help=(
+                            "Legacy shared separation/diversity margin. It is used as the fallback "
+                            "for either new gamma argument that is not supplied; default fallback is 1.0."
+                        ))
     parser.add_argument("--edl_proto_balance_classes", default="y", choices=["y", "n"],
                         help="Average prototype attraction/separation by class instead of by sample.")
+
+
+def _resolve_proto_margins(args):
+    legacy_margin = getattr(args, "edl_proto_margin", None)
+    shared_fallback = 1.0 if legacy_margin is None else float(legacy_margin)
+    separation_margin = getattr(args, "edl_proto_gamma_sep", None)
+    diversity_margin = getattr(args, "edl_proto_gamma_div", None)
+    separation_margin = shared_fallback if separation_margin is None else float(separation_margin)
+    diversity_margin = shared_fallback if diversity_margin is None else float(diversity_margin)
+    if separation_margin < 0.0 or diversity_margin < 0.0:
+        raise ValueError("Prototype separation/diversity margins must be non-negative.")
+    return separation_margin, diversity_margin
 
 
 def config():
 
     proto_parser = argparse.ArgumentParser(add_help=False)
     _add_proto_args(proto_parser)
+    if any(flag in sys.argv[1:] for flag in ("-h", "--help")):
+        print("Prototype-DST specific arguments:")
+        proto_parser.print_help()
+        print("\nShared DST/MIL training arguments:")
     proto_args, remaining = proto_parser.parse_known_args()
 
     original_argv = sys.argv[:]
@@ -97,6 +132,7 @@ def config():
 
     for key, value in vars(proto_args).items():
         setattr(args, key, value)
+    args.edl_proto_gamma_sep, args.edl_proto_gamma_div = _resolve_proto_margins(args)
     return args
 
 
@@ -209,7 +245,7 @@ def _zero_like_loss(edl_out):
     return edl_out["prob"].sum() * 0.0
 
 
-def _single_output_proto_reg(edl_out, labels, margin, balance_classes=True):
+def _single_output_proto_reg(edl_out, labels, separation_margin, balance_classes=True):
     """Sample-prototype attraction and opposite-class separation for one head."""
     if "prototype_distances" not in edl_out:
         zero = _zero_like_loss(edl_out)
@@ -235,7 +271,7 @@ def _single_output_proto_reg(edl_out, labels, margin, balance_classes=True):
         nearest_opposite = class_distances[:, other_class_mask, :].reshape(
             class_distances.size(0), -1
         ).min(dim=-1).values
-        class_separations.append(F.relu(float(margin) - nearest_opposite).mean())
+        class_separations.append(F.relu(float(separation_margin) - nearest_opposite).mean())
 
     if not class_attractions:
         zero = _zero_like_loss(edl_out)
@@ -260,12 +296,12 @@ def _single_output_proto_reg(edl_out, labels, margin, balance_classes=True):
             )
             sample_class_mask[batch_idx, labels] = False
             nearest_opposite = distances[sample_class_mask].view(distances.size(0), -1).min(dim=-1).values
-        separation = F.relu(float(margin) - nearest_opposite).mean()
+        separation = F.relu(float(separation_margin) - nearest_opposite).mean()
 
     return attraction, separation, attraction + separation
 
 
-def _prototype_diversity_loss(model, margin):
+def _prototype_diversity_loss(model, diversity_margin):
     heads = model.prototype_heads() if hasattr(model, "prototype_heads") else {}
     losses = []
 
@@ -288,7 +324,7 @@ def _prototype_diversity_loss(model, margin):
                 dtype=torch.bool,
                 device=class_prototypes.device,
             )
-            losses.append(F.relu(float(margin) - pairwise_distances[mask]).mean())
+            losses.append(F.relu(float(diversity_margin) - pairwise_distances[mask]).mean())
 
     if losses:
         return torch.stack(losses).mean()
@@ -298,7 +334,7 @@ def _prototype_diversity_loss(model, margin):
 
 
 def prototype_regularization_loss(model, edl_out, labels, args):
-    margin = float(getattr(args, "edl_proto_margin", 1.0))
+    separation_margin, diversity_margin = _resolve_proto_margins(args)
     attract_weight = float(getattr(args, "edl_proto_attract_weight", 0.0))
     separation_weight = float(getattr(args, "edl_proto_separation_weight", 0.0))
     diversity_weight = float(getattr(args, "edl_proto_diversity_weight", 0.0))
@@ -313,7 +349,7 @@ def prototype_regularization_loss(model, edl_out, labels, args):
     ]
     if not head_outputs:
         zero = _zero_like_loss(edl_out)
-        diversity_loss = _prototype_diversity_loss(model, margin)
+        diversity_loss = _prototype_diversity_loss(model, diversity_margin)
         total = diversity_weight * diversity_loss
         return total, {
             "proto_attract": zero.detach(),
@@ -328,7 +364,7 @@ def prototype_regularization_loss(model, edl_out, labels, args):
         attraction, separation, _ = _single_output_proto_reg(
             head_out,
             labels,
-            margin,
+            separation_margin,
             balance_classes=balance_classes,
         )
         attractions.append(attraction)
@@ -336,7 +372,7 @@ def prototype_regularization_loss(model, edl_out, labels, args):
 
     attraction_loss = torch.stack(attractions).mean()
     separation_loss = torch.stack(separations).mean()
-    diversity_loss = _prototype_diversity_loss(model, margin)
+    diversity_loss = _prototype_diversity_loss(model, diversity_margin)
 
     total = (
         attract_weight * attraction_loss
@@ -829,6 +865,218 @@ def initialize_prototypes_from_embedding_bank(model, args):
     return _attach_prototype_bank(model, bank_rows)
 
 
+def _normalize_sample_id(value):
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value)
+
+
+def _patient_id_set(frame):
+    if frame is None or len(frame) == 0:
+        return set()
+    if "patient_id" not in frame.columns:
+        raise ValueError("Fold-safe prototype selection requires a patient_id column.")
+    return {_normalize_sample_id(value) for value in frame["patient_id"]}
+
+
+def _select_fold_best_score_rows(
+    metadata_df,
+    train_df,
+    val_df,
+    test_df,
+    label_col,
+    prototypes_per_class,
+):
+    key_cols = ["patient_id", "image_id"]
+    required_metadata = set(key_cols + ["embedding_start", "embedding_end", "origin_prediction_score"])
+    missing_metadata = sorted(required_metadata.difference(metadata_df.columns))
+    if missing_metadata:
+        raise ValueError(
+            "fold_best_scores metadata is missing columns: " + ", ".join(missing_metadata)
+        )
+    required_train = set(key_cols + [label_col])
+    missing_train = sorted(required_train.difference(train_df.columns))
+    if missing_train:
+        raise ValueError(
+            "fold_best_scores training data is missing columns: " + ", ".join(missing_train)
+        )
+    if int(prototypes_per_class) < 1:
+        raise ValueError("prototypes_per_class must be positive for fold_best_scores.")
+
+    train_patients = _patient_id_set(train_df)
+    val_patients = _patient_id_set(val_df)
+    test_patients = _patient_id_set(test_df)
+    if train_patients.intersection(val_patients):
+        raise ValueError("Training and validation patient IDs overlap during prototype selection.")
+    if train_patients.intersection(test_patients):
+        raise ValueError("Training and held-out test patient IDs overlap during prototype selection.")
+
+    train_keys = train_df[key_cols + [label_col]].copy()
+    metadata = metadata_df.drop(columns=[label_col], errors="ignore").copy()
+    for frame in (train_keys, metadata):
+        frame["patient_id"] = frame["patient_id"].map(_normalize_sample_id)
+        frame["image_id"] = frame["image_id"].map(_normalize_sample_id)
+
+    label_counts = train_keys.groupby(key_cols, dropna=False)[label_col].nunique()
+    if (label_counts > 1).any():
+        raise ValueError("Training data contains conflicting labels for a patient/image key.")
+    train_keys = train_keys.drop_duplicates(key_cols, keep="first")
+    if metadata.duplicated(key_cols).any():
+        raise ValueError("Embedding metadata contains duplicate patient/image keys.")
+
+    candidates = train_keys.merge(
+        metadata,
+        on=key_cols,
+        how="left",
+        validate="one_to_one",
+        indicator=True,
+    )
+    missing_embeddings = candidates[candidates["_merge"] != "both"]
+    if not missing_embeddings.empty:
+        example = missing_embeddings.iloc[0]
+        raise ValueError(
+            "No cached embedding metadata for fold-training sample "
+            f"patient_id={example['patient_id']}, image_id={example['image_id']}."
+        )
+    candidates = candidates.drop(columns="_merge")
+    candidates[label_col] = pd.to_numeric(candidates[label_col], errors="raise").astype(int)
+    if not candidates[label_col].isin([0, 1]).all():
+        raise ValueError("fold_best_scores currently supports binary labels 0/1 only.")
+    candidates["origin_prediction_score"] = pd.to_numeric(
+        candidates["origin_prediction_score"], errors="raise"
+    ).astype(float)
+    if not np.isfinite(candidates["origin_prediction_score"]).all():
+        raise ValueError("origin_prediction_score contains NaN or infinite values.")
+    if not candidates["origin_prediction_score"].between(0.0, 1.0).all():
+        raise ValueError("origin_prediction_score must lie in [0, 1].")
+
+    labels = candidates[label_col].to_numpy(dtype=int)
+    positive_scores = candidates["origin_prediction_score"].to_numpy(dtype=float)
+    candidates["source_true_class_score"] = np.where(
+        labels == 1,
+        positive_scores,
+        1.0 - positive_scores,
+    )
+    if "origin_predicted_class" in candidates.columns:
+        predicted = pd.to_numeric(
+            candidates["origin_predicted_class"], errors="raise"
+        ).astype(int).to_numpy()
+    else:
+        predicted = (positive_scores >= 0.5).astype(int)
+    candidates["source_predicted_class"] = predicted
+    candidates["source_correct"] = predicted == labels
+
+    selected = []
+    for class_idx in (0, 1):
+        class_rows = candidates[candidates[label_col] == class_idx].copy()
+        if class_rows.empty:
+            raise ValueError(f"No class {class_idx} fold-training samples are available for prototypes.")
+        class_rows = class_rows.sort_values(
+            ["source_correct", "source_true_class_score", "patient_id", "image_id"],
+            ascending=[False, False, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        for rank_idx in range(int(prototypes_per_class)):
+            row = class_rows.iloc[rank_idx % len(class_rows)].copy()
+            row["prototype_class"] = class_idx
+            row["prototype_rank"] = rank_idx
+            row["selection_rank"] = rank_idx
+            row["selection_method"] = "fold_best_scores"
+            row["source_label"] = int(row[label_col])
+            row["source_prediction_score"] = float(row["origin_prediction_score"])
+            row["source_selection_score"] = float(row["source_true_class_score"])
+            row["source_selection_class"] = class_idx
+            row["source_split"] = "train"
+            selected.append(row)
+
+    selected_df = pd.DataFrame(selected).reset_index(drop=True)
+    selected_patients = set(selected_df["patient_id"].map(_normalize_sample_id))
+    if not selected_patients.issubset(train_patients):
+        raise AssertionError("A selected prototype did not originate from the current fold training set.")
+    if selected_patients.intersection(val_patients | test_patients):
+        raise AssertionError("A selected prototype patient appears in validation or held-out test data.")
+    return selected_df
+
+
+def initialize_prototypes_from_fold_best_scores(model, train_df, val_df, test_df, args):
+    if getattr(args, "feature_extraction", None) != "bag_embedding":
+        raise ValueError("fold_best_scores requires --feature_extraction bag_embedding.")
+    cache_dir = Path(getattr(args, "embedding_cache_dir", ""))
+    metadata_path = cache_dir / "metadata.csv"
+    embeddings_path = cache_dir / "embeddings.npy"
+    if not metadata_path.is_file() or not embeddings_path.is_file():
+        raise FileNotFoundError(
+            "fold_best_scores requires metadata.csv and embeddings.npy under "
+            f"--embedding_cache_dir; got {cache_dir}."
+        )
+
+    metadata = pd.read_csv(metadata_path, dtype={"patient_id": str, "image_id": str})
+    embeddings = np.load(embeddings_path, mmap_mode="r")
+    heads = model.prototype_heads()
+    bank_rows = []
+    for head_name, head in heads.items():
+        selected = _select_fold_best_score_rows(
+            metadata,
+            train_df,
+            val_df,
+            test_df,
+            args.label,
+            head.prototypes_per_class,
+        )
+        vectors = []
+        for _, row in selected.iterrows():
+            start = int(row["embedding_start"])
+            end = int(row["embedding_end"])
+            if end - start != 1 or start < 0 or end > int(embeddings.shape[0]):
+                raise ValueError(
+                    "fold_best_scores expects one valid embedding row per image; "
+                    f"got [{start}, {end}) for patient_id={row['patient_id']}, "
+                    f"image_id={row['image_id']}."
+                )
+            vectors.append(np.asarray(embeddings[start], dtype=np.float32))
+
+        prototype_array = np.asarray(vectors, dtype=np.float32)
+        if prototype_array.shape[1] != head.in_features:
+            raise ValueError(
+                f"Embedding dimension {prototype_array.shape[1]} does not match "
+                f"prototype head dimension {head.in_features}."
+            )
+        if head.normalize:
+            prototype_array = _normalize_prototype_matrix(prototype_array)
+        head.set_prototypes_from_embeddings(
+            prototype_array.reshape(head.num_classes, head.prototypes_per_class, head.in_features)
+        )
+
+        for _, row in selected.iterrows():
+            class_idx = int(row["prototype_class"])
+            rank_idx = int(row["prototype_rank"])
+            bank_rows.append({
+                "head_name": head_name,
+                "prototype_global_idx": class_idx * head.prototypes_per_class + rank_idx,
+                "prototype_class": class_idx,
+                "prototype_rank": rank_idx,
+                "prototype_id": f"c{class_idx}_p{rank_idx}",
+                "source_patient_id": str(row["patient_id"]),
+                "source_image_id": str(row["image_id"]),
+                "source_label": int(row["source_label"]),
+                "source_prediction_score": float(row["source_prediction_score"]),
+                "source_true_class_score": float(row["source_true_class_score"]),
+                "source_selection_score": float(row["source_selection_score"]),
+                "source_selection_class": int(row["source_selection_class"]),
+                "source_predicted_class": int(row["source_predicted_class"]),
+                "source_correct": bool(row["source_correct"]),
+                "source_split": "train",
+                "selection_rank": rank_idx,
+                "selection_method": "fold_best_scores",
+                "embedding_row": int(row["embedding_start"]),
+            })
+        print(
+            f"[DST_PROTO] {head_name}: initialized {len(selected)} prototypes from "
+            "current-fold training samples using original-MIL true-class scores."
+        )
+    return _attach_prototype_bank(model, bank_rows)
+
+
 def _to_str_list(values):
     return ["" if value is None else str(value) for value in values]
 
@@ -915,7 +1163,15 @@ def _select_best_sample_prototypes(head, bucket, head_name):
 
 
 @torch.no_grad()
-def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
+def initialize_prototypes_from_train_split(
+    model,
+    train_df,
+    args,
+    device,
+    fold,
+    val_df=None,
+    test_df=None,
+):
     init_method = getattr(args, "edl_proto_init", "embedding_bank")
     if init_method == "random":
         print("[DST_PROTO] Prototype initialization skipped; using random init.")
@@ -925,6 +1181,19 @@ def initialize_prototypes_from_train_split(model, train_df, args, device, fold):
     if not heads:
         print("[DST_PROTO] No prototype heads found; skipping initialization.")
         return None
+
+    if init_method == "fold_best_scores":
+        print(
+            "[DST_PROTO] Initializing prototypes from current-fold training samples "
+            "ranked by original-MIL true-class score..."
+        )
+        return initialize_prototypes_from_fold_best_scores(
+            model,
+            train_df,
+            val_df,
+            test_df,
+            args,
+        )
 
     if init_method == "embedding_bank":
         bank_df = initialize_prototypes_from_embedding_bank(model, args)
@@ -1568,6 +1837,10 @@ def do_edl_proto_training(args, device):
 
     all_val_results = []
     fold_assignments = []
+    # Keep the raw predictions from every fold so the reviewer-analysis script
+    # can reconstruct out-of-fold validation performance and the five-model
+    # held-out test ensemble without rerunning inference.
+    all_fold_prediction_dfs = []
 
     for fold, (train_df, val_df) in enumerate(split_iter):
         if fold < args.start_fold:
@@ -1598,7 +1871,15 @@ def do_edl_proto_training(args, device):
         model.to(device)
 
         if not loaded_proto_checkpoint:
-            prototype_bank_df = initialize_prototypes_from_train_split(model, train_df, args, device, fold)
+            prototype_bank_df = initialize_prototypes_from_train_split(
+                model,
+                train_df,
+                args,
+                device,
+                fold,
+                val_df=val_df,
+                test_df=test_df,
+            )
             if prototype_bank_df is not None:
                 save_prototype_bank_csv(
                     path_results_fold / f"{args.dataset}_dst_proto_prototype_bank_fold_{fold}.csv",
@@ -1715,6 +1996,7 @@ def do_edl_proto_training(args, device):
 
         if all_split_dfs:
             fold_pred_df = pd.concat(all_split_dfs, ignore_index=True)
+            all_fold_prediction_dfs.append(fold_pred_df)
             fold_pred_df.to_csv(
                 path_results_fold / f"{args.dataset}_dst_proto_predictions_fold_{fold}.csv",
                 index=False,
@@ -1748,6 +2030,39 @@ def do_edl_proto_training(args, device):
             index=False,
         )
         print(f"Fold assignments saved ({len(fold_df)} validation samples)")
+
+    if all_fold_prediction_dfs:
+        all_predictions_df = pd.concat(all_fold_prediction_dfs, ignore_index=True)
+        all_predictions_df.to_csv(
+            args.output_path / f"{args.dataset}_dst_proto_all_predictions.csv",
+            index=False,
+        )
+
+        # Exactly one validation prediction per development sample: the model
+        # from the fold where that sample was held out.  These are the scores
+        # used to choose operating thresholds, never the held-out test scores.
+        dev_predictions_df = all_predictions_df[
+            all_predictions_df["split"] == "val"
+        ].reset_index(drop=True)
+        dev_predictions_df.to_csv(
+            args.output_path / f"{args.dataset}_dst_proto_dev_predictions.csv",
+            index=False,
+        )
+
+        # One held-out test prediction per model/fold.  The analysis code first
+        # aggregates image scores within patient and then averages over folds.
+        test_all_folds_df = all_predictions_df[
+            all_predictions_df["split"] == "test"
+        ].reset_index(drop=True)
+        test_all_folds_df.to_csv(
+            args.output_path / f"{args.dataset}_dst_proto_test_all_folds.csv",
+            index=False,
+        )
+        print(
+            "Saved analysis-ready predictions: "
+            f"{len(dev_predictions_df)} validation OOF rows and "
+            f"{len(test_all_folds_df)} held-out test fold rows"
+        )
 
     return args.output_path
 

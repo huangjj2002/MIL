@@ -1,0 +1,6 @@
+model,source_files,source_test_rows,source_patients,duplicate_keys,missing_scores,nonfinite_scores,aggregation,common_rows,common_patients
+DST k=10,/mnt/g/611/glam/proto_embedding_rerun/DST_k_10/per_model_predictions/ensemble_edl_predictions.csv,8433,862,0,0,0,existing five-fold ensemble file,8409,862
+GLAM,/mnt/g/611/612/glam-origin/glam-origin/glam_kfold_ft_20260611_095443/ensemble_predictions.csv,8409,862,0,0,0,existing five-fold ensemble file,8409,862
+Mammo-FM,/mnt/g/611/612/613/Mammo-FM/data_predictions_ensemble.csv,8433,862,0,0,0,existing five-fold ensemble file,8409,862
+Mammo-CLIP,/mnt/g/611/612/613/lr_5e-05_epochs_25_weighted_BCE_y_cancer_data_frac_1.0_run_origin_b5_5fold_e25_p4/ensemble_all_predictions.csv,8409,862,0,0,0,existing five-fold ensemble file,8409,862
+MIL,/mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_0/ViNDr_mil_predictions_fold_0.csv | /mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_1/ViNDr_mil_predictions_fold_1.csv | /mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_2/ViNDr_mil_predictions_fold_2.csv | /mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_3/ViNDr_mil_predictions_fold_3.csv | /mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_4/ViNDr_mil_predictions_fold_4.csv,8409,862,0,0,0,arithmetic mean of five saved test probabilities per image,8409,862

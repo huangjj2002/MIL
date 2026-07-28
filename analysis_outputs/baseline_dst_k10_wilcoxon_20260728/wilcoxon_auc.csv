@@ -1,0 +1,9 @@
+correction_family,grain,metric,comparison,baseline,n_pairs,dst_mean,baseline_mean,mean_delta_dst_minus_baseline,median_delta_dst_minus_baseline,wins_dst,losses_dst,ties,wilcoxon_w,p_raw,rank_biserial_dst_minus_baseline,p_holm,significant_raw_0p05,significant_holm_0p05
+AUROC across both grains (8 tests),image,auc,DST k=10 vs GLAM,GLAM,5,0.7642146019708048,0.6876790196099797,0.07653558236082511,0.08029322349710699,5,0,0,0.0,0.0625,1.0,0.5,False,False
+AUROC across both grains (8 tests),image,auc,DST k=10 vs Mammo-FM,Mammo-FM,5,0.7642146019708048,0.8097761142529212,-0.04556151228211638,-0.03466615090131819,0,5,0,0.0,0.0625,-1.0,0.5,False,False
+AUROC across both grains (8 tests),image,auc,DST k=10 vs MIL,MIL,5,0.7642146019708048,0.794105746425056,-0.029891144454251273,-0.03328593377137079,1,4,0,1.0,0.125,-0.8666666666666667,0.5,False,False
+AUROC across both grains (8 tests),image,auc,DST k=10 vs Mammo-CLIP,Mammo-CLIP,5,0.7642146019708048,0.7841658221917122,-0.019951220220907385,-0.02373247033441217,2,3,0,3.0,0.3125,-0.6,0.625,False,False
+AUROC across both grains (8 tests),patient,auc,DST k=10 vs GLAM,GLAM,5,0.8097271648873072,0.6681026409439971,0.14162452394331024,0.13260910282824512,5,0,0,0.0,0.0625,1.0,0.5,False,False
+AUROC across both grains (8 tests),patient,auc,DST k=10 vs MIL,MIL,5,0.8097271648873072,0.8496909533620528,-0.039963788474745555,-0.044452768933008646,0,5,0,0.0,0.0625,-1.0,0.5,False,False
+AUROC across both grains (8 tests),patient,auc,DST k=10 vs Mammo-FM,Mammo-FM,5,0.8097271648873072,0.8294999063495038,-0.01977274146219641,-0.008990447649372513,1,4,0,1.0,0.125,-0.8666666666666667,0.5,False,False
+AUROC across both grains (8 tests),patient,auc,DST k=10 vs Mammo-CLIP,Mammo-CLIP,5,0.8097271648873072,0.7983392645314353,0.011387900355871939,-0.0006243366423175356,2,3,0,7.0,1.0,0.06666666666666667,1.0,False,False

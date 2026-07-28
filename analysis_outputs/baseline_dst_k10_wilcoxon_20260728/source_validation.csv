@@ -1,0 +1,26 @@
+model,fold,source_file,source_test_rows,common_test_rows,common_test_patients,positives,duplicate_patient_image_keys,score_nulls
+Mammo-FM,0,/mnt/g/611/612/613/Mammo-FM/data_predictions_fold0.csv,8433,8409,862,66,0,0
+Mammo-FM,1,/mnt/g/611/612/613/Mammo-FM/data_predictions_fold1.csv,8433,8409,862,66,0,0
+Mammo-FM,2,/mnt/g/611/612/613/Mammo-FM/data_predictions_fold2.csv,8433,8409,862,66,0,0
+Mammo-FM,3,/mnt/g/611/612/613/Mammo-FM/data_predictions_fold3.csv,8433,8409,862,66,0,0
+Mammo-FM,4,/mnt/g/611/612/613/Mammo-FM/data_predictions_fold4.csv,8433,8409,862,66,0,0
+Mammo-CLIP,0,/mnt/g/611/612/613/lr_5e-05_epochs_25_weighted_BCE_y_cancer_data_frac_1.0_run_origin_b5_5fold_e25_p4/fold0_all_predictions.csv,8409,8409,862,66,0,0
+Mammo-CLIP,1,/mnt/g/611/612/613/lr_5e-05_epochs_25_weighted_BCE_y_cancer_data_frac_1.0_run_origin_b5_5fold_e25_p4/fold1_all_predictions.csv,8409,8409,862,66,0,0
+Mammo-CLIP,2,/mnt/g/611/612/613/lr_5e-05_epochs_25_weighted_BCE_y_cancer_data_frac_1.0_run_origin_b5_5fold_e25_p4/fold2_all_predictions.csv,8409,8409,862,66,0,0
+Mammo-CLIP,3,/mnt/g/611/612/613/lr_5e-05_epochs_25_weighted_BCE_y_cancer_data_frac_1.0_run_origin_b5_5fold_e25_p4/fold3_all_predictions.csv,8409,8409,862,66,0,0
+Mammo-CLIP,4,/mnt/g/611/612/613/lr_5e-05_epochs_25_weighted_BCE_y_cancer_data_frac_1.0_run_origin_b5_5fold_e25_p4/fold4_all_predictions.csv,8409,8409,862,66,0,0
+MIL,0,/mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_0/ViNDr_mil_predictions_fold_0.csv,8409,8409,862,66,0,0
+MIL,1,/mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_1/ViNDr_mil_predictions_fold_1.csv,8409,8409,862,66,0,0
+MIL,2,/mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_2/ViNDr_mil_predictions_fold_2.csv,8409,8409,862,66,0,0
+MIL,3,/mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_3/ViNDr_mil_predictions_fold_3.csv,8409,8409,862,66,0,0
+MIL,4,/mnt/g/611/612/MIL-Origin/MIL-Origin/2026-06-09/fold_4/ViNDr_mil_predictions_fold_4.csv,8409,8409,862,66,0,0
+GLAM,0,/mnt/g/611/612/glam-origin/glam-origin/glam_kfold_ft_20260611_095443/per_model_predictions/fold0_predictions.csv,8409,8409,862,66,0,0
+GLAM,1,/mnt/g/611/612/glam-origin/glam-origin/glam_kfold_ft_20260611_095443/per_model_predictions/fold1_predictions.csv,8409,8409,862,66,0,0
+GLAM,2,/mnt/g/611/612/glam-origin/glam-origin/glam_kfold_ft_20260611_095443/per_model_predictions/fold2_predictions.csv,8409,8409,862,66,0,0
+GLAM,3,/mnt/g/611/612/glam-origin/glam-origin/glam_kfold_ft_20260611_095443/per_model_predictions/fold3_predictions.csv,8409,8409,862,66,0,0
+GLAM,4,/mnt/g/611/612/glam-origin/glam-origin/glam_kfold_ft_20260611_095443/per_model_predictions/fold4_predictions.csv,8409,8409,862,66,0,0
+DST k=10,0,/mnt/g/611/612/Mammo-CLIP-DST-EDL/Mammo-CLIP-DST-EDL/embedding_proto_compare_loss_5fold_e250_rerun/DST_k10_run_20260611_143428/fold_0/dst_all_predictions.csv,8409,8409,862,66,0,0
+DST k=10,1,/mnt/g/611/612/Mammo-CLIP-DST-EDL/Mammo-CLIP-DST-EDL/embedding_proto_compare_loss_5fold_e250_rerun/DST_k10_run_20260611_143428/fold_1/dst_all_predictions.csv,8409,8409,862,66,0,0
+DST k=10,2,/mnt/g/611/612/Mammo-CLIP-DST-EDL/Mammo-CLIP-DST-EDL/embedding_proto_compare_loss_5fold_e250_rerun/DST_k10_run_20260611_143428/fold_2/dst_all_predictions.csv,8409,8409,862,66,0,0
+DST k=10,3,/mnt/g/611/612/Mammo-CLIP-DST-EDL/Mammo-CLIP-DST-EDL/embedding_proto_compare_loss_5fold_e250_rerun/DST_k10_run_20260611_143428/fold_3/dst_all_predictions.csv,8409,8409,862,66,0,0
+DST k=10,4,/mnt/g/611/612/Mammo-CLIP-DST-EDL/Mammo-CLIP-DST-EDL/embedding_proto_compare_loss_5fold_e250_rerun/DST_k10_run_20260611_143428/fold_4/dst_all_predictions.csv,8409,8409,862,66,0,0

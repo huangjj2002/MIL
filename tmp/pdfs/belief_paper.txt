@@ -1,0 +1,415 @@
+     Uncertainty-Aware Deep Learning for Breast
+    Cancer Detection in Mammograms with Breast
+                      Implants
+
+             Junjie Huang1 , Yucheng Xing2 , Ling Huang3 , and Hao Du1⋆
+      1
+        Hangzhou International Innovation Institute, Beihang University, China
+2
+    Guangzhou Research Translation and Innovation Institute, National University of
+                               Singapore, Singapore
+                   3
+                     Imperial College London, United Kingdom
+
+
+          Abstract. Deep learning has improved breast cancer detection in
+          mammograms, but most models are trained on patients without im-
+          plants. In implant patients, the implant obscures parenchyma and masks
+          lesions such as masses and calcifications, lowering sensitivity; because
+          relevant information is partially missing, prior models can still produce
+          confident yet unreliable predictions. To address this, we propose an
+          evidential detection network that couples a mammography foundation
+          model backbone with a prototype-based Dempster–Shafer network,
+          pairing each prediction with an explicit uncertainty estimate and a
+          prototype-based explanation. Among four SOTA baseline models, our
+          model achieved the highest AUROC (0.864), balanced accuracy (0.828),
+          and specificity (0.793) in the breast implant dataset EMBED, improving
+          over its Mammo-CLIP backbone (AUROC 0.781). The higher balanced
+          accuracy came mainly from improved specificity, with sensitivity remain-
+          ing competitive. For correctly detected cancers, the model grounded
+          each prediction in clinically meaningful prototypes that share lesion
+          descriptors with the target image and assigned them low uncertainty,
+          supporting interpretable and confident decisions
+
+          Keywords: Uncertainty · Breast cancer · Implants · Evidential learning
+
+
+1     Introduction
+Breast cancer is the most commonly diagnosed cancer among women, with an
+estimated 2.3 million new cases and 670,000 deaths worldwide in 2022 [1]. Be-
+cause early detection substantially improves survival, mammography serves as
+the gold standard for early screening, providing high-resolution visualization of
+lesions such as microcalcifications and masses. However, a growing number of
+women have breast implants from augmentation or reconstruction, and these
+implants complicate screening. As shown in Figure 1, the implant appears as a
+large high-density region that blocks the field of view and compresses the breast
+tissue. This occlusion makes lesions harder to detect and reduces the sensitivity
+of mammography in patients with implants.
+⋆
+    Corresponding author: du_hao@buaa.edu.cn
+2        J. Huang et al.
+
+
+
+
+      (a) RCC              (b) RCCID           (c) RMLO             (d) RMLOID
+
+Fig. 1: Standard craniocaudal (RCC) and mediolateral oblique (RMLO) views (a,
+c), where the implant obscures the parenchyma, and the corresponding implant-
+displaced (ID) views (b, d), where the Eklund maneuver pushes the implant back
+to reveal breast tissue.
+
+
+    To improve screening accuracy, deep learning has been widely applied to
+breast cancer detection. Early methods relied on convolutional neural networks
+(CNNs), such as the model of Wu et al. [14], which achieved promising results.
+More recently, multimodal vision-language models [11, 5, 8, 7] have incorporated
+textual information from diagnostic reports and achieved strong screening per-
+formance. These models are typically trained and evaluated on mammograms
+without implants and their reliability on implant cases remains largely unveri-
+fied. When an implant occludes the breast, it systematically blocks critical tissue
+information and leaves the model in a state of genuine ignorance rather than
+mere ambiguity. A standard confidence score cannot distinguish this missing-
+information case from ordinary uncertainty, so the model may still output a
+confident but unreliable prediction. This limitation motivates the use of evi-
+dence theory. Whereas Bayesian approximations [6] and deep ensembles [10]
+output only a scalar confidence, the Dempster-Shafer theory [12, 3] represents
+belief and ignorance as separate quantities. This explicit treatment of ignorance
+is exactly what implant screening requires, because it lets the model flag cases
+where missing information prevents a reliable decision instead of issuing a con-
+fident misprediction.
+    To the best of our knowledge, this is the first work to combine uncertainty
+modeling with breast cancer detection in patients with implants. To close this
+gap, we propose an evidential network that couples a vision-language foundation
+backbone with a prototype-based Dempster-Shafer module (Figure 2).
+
+
+2     Methods
+2.1    Feature Representation via Multiple Instance Learning
+
+We apply uncertainty theory to the classification model and strengthen it with
+a multiple instance learning (MIL) framework [11]. Each mammogram is first
+                    Uncertainty-Aware Deep Learning for Breast Cancer Detection                                      3
+
+
+    Mammography Image                 Image Patch                                                    Multi-scale
+                                                                               Feature Pyramid      Feature Maps
+                                                        Mammo-                  Network (FPN)
+                                      Report             CLIP                                          Scale 1
+                             Report    Text               Text
+                              Text                      Encoder
+                                                              Vision-Language
+                                                                                                       Scale 2
+                                                                   Model
+    Patch
+                                                                 Pretraining
+  Extraction                                            Mammo-
+                                                          CLIP
+   Image Patch                                           Image                                         Scale 3
+                                                        Encoder
+
+                                                       (B) Mammo-CLIP Feature Extraction Module
+             Mammo-CLIP
+       Feature Extraction Module                      MIL          Attention
+                                       Scale 1
+                                                    Encoder        Pooling
+
+                                                      MIL          Attention             Scale        Feature
+                                       Scale 2                     Pooling            Aggregation   Embedding z
+                                                    Encoder
+
+         Multi-scale MIL Module                       MIL          Attention
+                                       Scale 3                     Pooling
+                                                    Encoder
+
+                                                       (C) Multi-scale MIL Module
+                Prototype-
+               DST Module              Feature
+                                                                                                      Uncertainty
+                                      Embedding
+                                          z                             Prototype
+                                                                                         Mass
+                                                        Distance        Evidence
+                 Output                                                Assignment       Fusion
+                                      Prototype
+                                                                                                         Class
+                                                                                                       Probability
+         (A) Overall Pipeline                           (D) Prototype-DST Module
+
+
+
+Fig. 2: Architecture of the proposed network. (A) Overall pipeline. (B) Mammo-
+CLIP feature extraction with a feature pyramid network (FPN) producing three-
+scale maps. (C) Multi-scale multiple instance learning (MIL) aggregating the
+scales into an embedding z. (D) Prototype-DST module comparing z with learn-
+able prototypes and fusing them by Dempster-Shafer theory (DST) into masses
+that yield the class probability and uncertainty.
+
+
+divided into a set of patches, which are encoded by the Mammo-CLIP [8] back-
+bone into instance embeddings. To capture lesions of different sizes, the back-
+bone feeds a feature pyramid network (FPN) that produces feature maps at
+three scales, and the multi-scale MIL module aggregates instance embeddings
+within each scale before combining the scales, so that both small microcalcifica-
+tions and large masses are represented. The MIL aggregator pools these instance
+embeddings into a single bag-level representation z, given by
+
+                                                 z = MIL(X ),                                                      (1)
+where X denotes the set of patch-level instance embeddings across scales. This
+representation is subsequently passed to an uncertainty module that performs
+uncertainty modeling and produces the predicted probability.
+4      J. Huang et al.
+
+2.2   Prototype-DST Module for Uncertainty Modeling
+
+The Dempster–Shafer theory of evidence (DST) [12, 3] explicitly mod-
+els uncertainty by distributing belief mass over the frame of discernment
+Ω = {ω1 , . . . , ωK } (K = 2 for our binary task). Given the bag-level representa-
+tion z of a mammogram, we follow the evidential neural network (ENN) [4] to
+map z to mass functions through class-specific prototypes. We use J prototypes
+per class, {pk,j : k = 1, . . . , K, j = 1, . . . , J}, where each prototype pk,j
+is assigned to class ωk , initialized by K-means clustering of the training-set
+embeddings, and refined as a parameter during training. Each prototype acts
+as a piece of evidence whose strength decreases with the Euclidean distance
+dk,j = ∥z − pk,j ∥2 :
+                             sk,j = αk,j exp −γk,j d2k,j ,
+                                                        
+                                                                                (2)
+where αk,j ∈ [0, 1] and γk,j > 0 are learned parameters controlling the maximum
+reliability and the distance decay. Because each prototype supports only its own
+class, the induced mass function is
+
+                            mk,j ({ωk }) = sk,j ,                             (3a)
+                               mk,j (Ω) = 1 − sk,j ,                          (3b)
+                             mk,j ({ωl }) = 0,      l ̸= k.                   (3c)
+
+The KJ prototype masses are combined by Dempster’s rule,
+                                        J
+                                      K M
+                                      M
+                                m=              mk,j ,                         (4)
+                                      k=1 j=1
+
+and the class probability is obtained by the pignistic transformation [13],
+                                                 1
+                           p̂k = m({ωk }) +         m(Ω).                      (5)
+                                                |Ω|
+
+Since the combined mass is supported only on singletons and Ω, this reduces to
+p̂k = m({ωk }) + m(Ω)/K.
+
+
+2.3   Loss Function
+Our loss combines a classification loss with a prototype regularization term that
+shapes the prototype space; each term serves a distinct goal. For a training set
+of N bags, let di,k,j = ∥zi − pk,j ∥2 denote the distance from bag i to prototype
+pk,j .
+    The classification loss drives accurate prediction and is defined as a weighted
+negative log-likelihood:
+                                         N
+                                      1 X
+                           Lcls = −        wy log p̂i,yi ,                     (6)
+                                      N i=1 i
+               Uncertainty-Aware Deep Learning for Breast Cancer Detection            5
+
+where yi is the ground-truth label of bag i, p̂i,k is the pignistic probability of class
+k for bag i (Eq. 5), and wyi is the class weight used to counter class imbalance.
+    We follow [2] to optimize the prototype learning process with three regular-
+ization terms. The attraction loss pulls each bag toward the nearest prototype
+of its ground-truth class, promoting intra-class compactness:
+                                              N
+                                       1 X
+                              Latt =        min d2     .                            (7)
+                                       N i=1 j i,yi ,j
+
+The separation loss pushes each bag away from prototypes of other classes,
+enforcing inter-class separation:
+                              N                          
+                           1 X                          2
+                    Lsep =       max 0, δsep − min di,k,j .                         (8)
+                           N i=1              k̸=yi , j
+
+
+The diversity loss keeps same-class prototypes apart, preventing prototype col-
+lapse:
+                      K
+                   1 X       1     X
+                                      max 0, δdiv − ∥pk,j − pk,q ∥22 ,
+                                                                    
+           Ldiv =                                                           (9)
+                   K      J(J − 1)
+                       k=1             j̸=q
+
+where j and q index distinct prototypes of class k. The total training loss is
+
+                       L = Lcls + λ1 Latt + λ2 Lsep + λ3 Ldiv ,                    (10)
+
+where λ1 , λ2 , λ3 control the focus on each regularization term, and δsep , δdiv are
+margins.
+
+
+3     Experimental Results
+3.1   Experimental Settings
+Our experiments were conducted on the Emory Breast Imaging Dataset (EM-
+BED)[9], using only images from patients with breast implants. This subset com-
+prises 42,857 images from 4,235 patients, split into 34,448 training and 8,409 test
+images. We trained the model using five-fold cross-validation, setting 10 proto-
+types per class (20 in total for this binary task). The regularization weights λ1 ,
+λ2 and λ3 were all set to 0.1. Adam optimizer with a learning rate of 5 × 10−3
+was used with 250 training epochs.
+
+3.2   Results and Discussion
+To evaluate our model, we compared it with four recent breast cancer detec-
+tion models that have shown strong performance, namely MIL[11], GLAM[5],
+Mammo-CLIP[8], and Mammo-FM[7]. Table 1 presents the results. Our model
+attained the highest AUROC (0.864), balanced accuracy (bACC,
+0.828), and specificity (0.793). Our sensitivity (0.853) remained competitive
+6       J. Huang et al.
+
+
+Table 1: Patient-level performance comparison under five-fold cross-validation.
+Results are reported as mean ± SD; 95% CIs are given in brackets. Threshold-
+dependent metrics are computed at the optimal operating point determined by
+Youden’s index.
+Model             AUROC             bACC           Sensitivity       Specificity
+
+MIL             0.845 ± 0.032    0.786 ± 0.026    0.948 ± 0.049     0.624 ± 0.017
+                [0.779, 0.904]   [0.728, 0.825]    [0.878, 0.951]   [0.592, 0.657]
+
+GLAM            0.668 ± 0.019    0.661 ± 0.030    0.558 ± 0.192     0.764 ± 0.146
+                [0.645, 0.691]   [0.624, 0.698]   [0.320, 0.796]    [0.582, 0.945]
+Mammo-          0.781 ± 0.045    0.743 ± 0.027    0.842 ± 0.158     0.643 ± 0.116
+CLIP            [0.670, 0.893]   [0.676, 0.809]   [0.450, 1.000]    [0.354, 0.932]
+
+Mammo-FM        0.813 ± 0.043    0.792 ± 0.036    0.895 ± 0.070     0.688 ± 0.016
+                [0.723, 0.888]   [0.710, 0.851]   [0.763, 0.913]    [0.657, 0.719]
+
+Ours           0.864 ± 0.006 0.828 ± 0.024        0.853 ± 0.070     0.793 ± 0.055
+                [0.856, 0.872] [0.797, 0.859]     [0.775, 0.859]     [0.725, 0.861]
+
+
+
+with the best baselines, and the improvement in balanced accuracy came mainly
+from higher specificity at a comparable sensitivity. As confidence intervals
+overlap for some baselines, we report these gains as consistent trends.
+    Beyond producing a prediction score, the prototype-DST module offers two
+further properties, namely interpretability and uncertainty quantification. Fig-
+ure 3 illustrates both for two true-positive cases. Each test mammogram is
+matched to its most similar learned prototype, and the two images share the
+same lesion descriptors, which makes the basis of the prediction explicit. The
+matched prototypes and low uncertainty together yield interpretable,
+confident decisions.
+    This study has limitations. First, external validation across diverse institu-
+tions and scanners is needed to confirm generalizability. Second, quantitative cal-
+ibration of the uncertainty estimates would strengthen their reliability. Third,
+comparison with radiologist performance and extension beyond binary cancer
+labels in implant cases are warranted. These will be addressed in future work.
+
+
+4     Conclusion
+We propose an evidential neural network based on a vision-language model for
+uncertainty quantification in patients with breast implants. It couples a Mammo-
+CLIP image encoder with a prototype-DST module that computes mass func-
+tions to yield prediction scores and uncertainty estimates. The model achieved an
+AUROC of 0.864, outperforming the strongest vision-language baseline (0.813),
+while providing interpretable prototype evidence and low uncertainty for confi-
+                  Uncertainty-Aware Deep Learning for Breast Cancer Detection                  7
+
+                 Prototype                              Matched True-Positive
+
+         Mass shape:Focal                              Mass shape:Focal
+   A       asymmetry                                     asymmetry
+           Mass margin:                                  Mass margin:
+            Obscured                                      Obscured              Model outputs
+                                    Top-1 prototype                             Prediction score
+               Mass                                           Mass
+         density:Isodense
+                                        match
+                                                        density:Isodense
+                                                                                0.696
+        Calcification:Coarse                                                    Uncertainty
+                                                      Calcification: Coarse
+          heterogeneous                                 heterogeneous           0.089
+
+
+
+
+   B    Mass shape:Irregular                          Mass shape:Irregular
+
+           Mass margin:                                  Mass margin:           Model outputs
+            Obscured                Top-1 prototype       Obscured              Prediction score
+                                        match                                   0.668
+                                                                                Uncertainty
+                                                                                0.109
+
+
+
+
+Fig. 3: Prototype-based interpretation of two true-positive cases. Each test mam-
+mogram (right) is matched to its most similar prototype (left), sharing lesion
+descriptors, with the prediction score and a low uncertainty shown at right.
+
+
+dent predictions. Future work will incorporate the text encoder to extend the
+framework to image fusion and segmentation tasks.
+
+
+References
+ 1. Bray, F., Laversanne, M., Sung, H., Ferlay, J., Siegel, R.L., Soerjomataram, I., Je-
+    mal, A.: Global cancer statistics 2022: Globocan estimates of incidence and mor-
+    tality worldwide for 36 cancers in 185 countries. CA: a cancer journal for clinicians
+    74(3), 229–263 (2024)
+ 2. Chen, C., Li, O., Tao, D., Barnett, A., Rudin, C., Su, J.K.: This Looks Like That:
+    Deep learning for interpretable image recognition. In: Advances in Neural Infor-
+    mation Processing Systems. vol. 32, pp. 8928–8939. Curran Associates, Inc., Red
+    Hook, NY, USA (2019), https://proceedings.neurips.cc/paper/2019/hash/
+    adf7ee2dcf142b0e11888e72b43fcb75-Abstract.html
+ 3. Dempster, A.P.: Upper and lower probabilities induced by a multivalued mapping.
+    Annals of Mathematical Statistics 38(2), 325–339 (1967)
+ 4. Denœux, T.: A neural network classifier based on Dempster–Shafer theory. IEEE
+    Transactions on Systems, Man, and Cybernetics, Part A: Systems and Humans
+    30(2), 131–150 (Mar 2000). https://doi.org/10.1109/3468.833094
+ 5. Du, Y., Chen, L., Dvornek, N.C.: Geometry-guided local alignment for multi-view
+    visual language pre-training in mammography. In: Medical Image Computing and
+    Computer Assisted Intervention – MICCAI 2025. Lecture Notes in Computer Sci-
+    ence, vol. 15965, pp. 299–310. Springer, Cham (2025)
+8       J. Huang et al.
+
+ 6. Gal, Y., Ghahramani, Z.: Dropout as a bayesian approximation: Representing
+    model uncertainty in deep learning. In: Balcan, M.F., Weinberger, K.Q. (eds.)
+    Proceedings of The 33rd International Conference on Machine Learning. Proceed-
+    ings of Machine Learning Research, vol. 48, pp. 1050–1059. PMLR, New York, New
+    York, USA (20–22 Jun 2016), https://proceedings.mlr.press/v48/gal16.html
+ 7. Ghosh, S., Joshi, V.P., Syed, R., Budhraja, P., Kassem, A., Morrison, K.C., Tang,
+    A., Wong, H.C.A., Varshney, A., Basak, P., Dai, W., Gichoya, J.W., Trivedi, H.M.,
+    Banerjee, I., Visweswaran, S., Poynton, C.B., Batmanghelich, K.: Mammo-fm:
+    Breast-specific foundational model for integrated mammographic diagnosis, prog-
+    nosis, and reporting (2026), https://arxiv.org/abs/2512.00198
+ 8. Ghosh, S., Poynton, C.B., Visweswaran, S., Batmanghelich, K.: Mammo-clip: A
+    vision language foundation model to enhance data efficiency and robustness in
+    mammography. In: Medical Image Computing and Computer Assisted Intervention
+    – MICCAI 2024. Lecture Notes in Computer Science, vol. 15012, pp. 632–642.
+    Springer, Cham (October 2024)
+ 9. Jeong, J.J., Vey, B.L., Bhimireddy, A., Kim, T., Santos, T., Correa, R., Dutt,
+    R., Mosunjac, M., Oprea-Ilies, G., Smith, G., Woo, M., McAdams, C.R., Newell,
+    M.S., Banerjee, I., Gichoya, J., Trivedi, H.: The emory breast imaging dataset
+    (embed): A racially diverse,granular dataset of 3.4 million screening and diagnos-
+    tic mammographic images. Radiology: Artificial Intelligence 5(1), e220047 (2023).
+    https://doi.org/10.1148/ryai.220047, https://doi.org/10.1148/ryai.220047
+10. Lakshminarayanan, B., Pritzel, A., Blundell, C.: Simple and scalable predictive un-
+    certainty estimation using deep ensembles (2017), https://arxiv.org/abs/1612.
+    01474
+11. Mourão, M., Nascimento, J.C., Santiago, C., Silveira, M.: Multi-scale attention-
+    based multiple instance learning for breast cancer diagnosis. In: Gee, J.C., Alexan-
+    der, D.C., Hong, J., Iglesias, J.E., Sudre, C.H., Venkataraman, A., Golland, P.,
+    Kim, J.H., Park, J. (eds.) Medical Image Computing and Computer Assisted Inter-
+    vention – MICCAI 2025. pp. 364–374. Springer Nature Switzerland, Cham (2026)
+12. Shafer, G.: A Mathematical Theory of Evidence. Princeton University Press,
+    Princeton, NJ (1976)
+13. Smets, P., Kennes, R.: The transferable belief model. Artificial Intelligence 66(2),
+    191–234 (1994)
+14. Wu, N., Phang, J., Park, J., Shen, Y., Huang, Z., Zorin, M., Jastrzebski, S., Fevry,
+    T., Katsnelson, J., Kim, E., et al.: Deep neural networks improve radiologists’
+    performance in breast cancer screening. IEEE Transactions on Medical Imaging
+    39(4), 1184–1194 (2020). https://doi.org/10.1109/TMI.2019.2945514
+

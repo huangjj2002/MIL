@@ -1,0 +1,13 @@
+{
+  "common_images": 8409,
+  "common_patients": 862,
+  "positive_patients": 19,
+  "negative_patients": 843,
+  "label_conflicts": 0,
+  "duplicate_common_keys": 0,
+  "missing_predictions": 0,
+  "nonfinite_predictions": 0,
+  "dst_full_images": 8433,
+  "dst_full_patient_auc": 0.8648311169382531,
+  "dst_common_patient_auc": 0.8645813822813261
+}

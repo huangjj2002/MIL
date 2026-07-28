@@ -45,6 +45,37 @@ def parse_args():
     parser.add_argument("--max-images", "--max_images", dest="max_images", default=None, type=int)
     parser.add_argument("--heatmap-alpha", "--heatmap_alpha", dest="heatmap_alpha", default=0.45, type=float)
     parser.add_argument("--colormap", default="magma", type=str)
+    parser.add_argument(
+        "--normalize-heatmap",
+        "--normalize_heatmap",
+        dest="normalize_heatmap",
+        default="y",
+        choices=["y", "n"],
+        help="Normalize each rendered heatmap inside its covered region for visibility.",
+    )
+    parser.add_argument(
+        "--selected-csv",
+        "--selected_csv",
+        dest="selected_csv",
+        default=None,
+        type=str,
+        help=(
+            "Optional selected-case CSV. If it has patient_id and image_id, those are used "
+            "directly. If it only has short DICOM names like TP_01.dcm, also pass "
+            "--selected-dcm-root so SOPInstanceUID can be read from the DICOM headers."
+        ),
+    )
+    parser.add_argument(
+        "--selected-dcm-root",
+        "--selected_dcm_root",
+        dest="selected_dcm_root",
+        default=None,
+        type=str,
+        help=(
+            "Optional root containing selected DICOMs, for example a folder with "
+            "TPcase/FPcase/TNcase subfolders from the review bundle."
+        ),
+    )
     parser.add_argument("--edl-proto-normalize", "--edl_proto_normalize", dest="edl_proto_normalize",
                         default="y", choices=["y", "n"])
     parser.add_argument("--gpu-id", "--gpu_id", dest="gpu_id", default=None, type=str)
@@ -182,12 +213,119 @@ def choose_scale(patch_metadata, requested_scale):
 def metadata_lookup(metadata):
     lookup = {}
     for _, row in metadata.iterrows():
-        key = (str(row.get("patient_id", "")), str(row.get("image_id", "")))
+        key = make_lookup_key(row.get("patient_id", ""), row.get("image_id", ""))
         lookup[key] = row.to_dict()
     return lookup
 
 
-def render_heatmap(image_path, rows, scores, meta_row, output_path, alpha, colormap_name):
+def normalize_key_part(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    return text
+
+
+def normalize_image_id(value):
+    text = normalize_key_part(value)
+    if not text:
+        return text
+    if text.lower().endswith(".dcm"):
+        text = text[:-4] + ".png"
+    elif "." not in Path(text).name:
+        text = f"{text}.png"
+    return text
+
+
+def make_lookup_key(patient_id, image_id):
+    return normalize_key_part(patient_id), normalize_image_id(image_id)
+
+
+def selected_case_folder(image_name):
+    prefix = str(image_name).split("_", 1)[0].upper()
+    return {
+        "TP": "TPcase",
+        "TN": "TNcase",
+        "FP": "FPcase",
+    }.get(prefix)
+
+
+def resolve_selected_dicom(dcm_root, image_name):
+    root = Path(dcm_root)
+    folder = selected_case_folder(image_name)
+    candidates = [root / image_name]
+    if folder:
+        candidates.extend([
+            root / folder / image_name,
+            root / "data" / folder / image_name,
+        ])
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"Could not resolve selected DICOM {image_name!r} under {dcm_root}. "
+        f"Tried: {[str(path) for path in candidates]}"
+    )
+
+
+def read_dicom_lookup_values(dcm_path):
+    try:
+        import pydicom
+    except ImportError as exc:
+        raise ImportError(
+            "pydicom is required when --selected-csv lacks original image_id and "
+            "--selected-dcm-root is used."
+        ) from exc
+
+    ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=True, force=True)
+    patient_id = normalize_key_part(getattr(ds, "PatientID", ""))
+    sop_uid = normalize_key_part(getattr(ds, "SOPInstanceUID", ""))
+    if not sop_uid:
+        raise ValueError(f"SOPInstanceUID missing from selected DICOM: {dcm_path}")
+    return patient_id, f"{sop_uid}.png"
+
+
+def load_selected_lookup(selected_csv, selected_dcm_root=None):
+    if not selected_csv:
+        return {}
+
+    selected_df = pd.read_csv(selected_csv).fillna("")
+    lookup = {}
+    for _, row in selected_df.iterrows():
+        image_name = normalize_key_part(row.get("image_name", ""))
+        group = normalize_key_part(row.get("group", ""))
+
+        image_id = ""
+        for col in ["image_id", "source_image_id", "original_image_id"]:
+            if col in selected_df.columns and normalize_key_part(row.get(col, "")):
+                image_id = normalize_image_id(row.get(col, ""))
+                break
+
+        patient_id = normalize_key_part(row.get("patient_id", ""))
+        if not image_id:
+            if not selected_dcm_root:
+                raise ValueError(
+                    f"Selected row for {image_name or '<unknown>'} has no image_id. "
+                    "Pass --selected-dcm-root to recover SOPInstanceUID from DICOM headers."
+                )
+            if not image_name:
+                raise ValueError("Selected CSV row has no image_name and no image_id.")
+            dcm_path = resolve_selected_dicom(selected_dcm_root, image_name)
+            dcm_patient_id, image_id = read_dicom_lookup_values(dcm_path)
+            patient_id = patient_id or dcm_patient_id
+
+        key = make_lookup_key(patient_id, image_id)
+        lookup[key] = {
+            "selection_group": group,
+            "selection_image_name": image_name,
+        }
+
+    print(f"[INFO] Loaded selected-case filter: {len(lookup)} images from {selected_csv}")
+    return lookup
+
+
+def render_heatmap(image_path, rows, scores, meta_row, output_path, alpha, colormap_name, normalize_heatmap):
     from PIL import Image
     import matplotlib
 
@@ -222,6 +360,14 @@ def render_heatmap(image_path, rows, scores, meta_row, output_path, alpha, color
     mask = heat_count > 0
     heat = np.zeros_like(heat_sum)
     heat[mask] = heat_sum[mask] / heat_count[mask]
+    if normalize_heatmap and mask.any():
+        covered = heat[mask]
+        min_value = float(covered.min())
+        max_value = float(covered.max())
+        if max_value > min_value:
+            heat[mask] = (covered - min_value) / (max_value - min_value)
+        else:
+            heat[mask] = 0.0
     heat = np.clip(heat, 0.0, 1.0)
 
     cmap = matplotlib.colormaps.get_cmap(colormap_name)
@@ -249,6 +395,18 @@ def export_heatmaps(args):
     if patch_metadata.empty:
         raise RuntimeError("No patch metadata rows left after split/scale filtering.")
 
+    selected_lookup = load_selected_lookup(args.selected_csv, args.selected_dcm_root)
+    if selected_lookup:
+        patch_keys = [
+            make_lookup_key(patient_id, image_id)
+            for patient_id, image_id in zip(patch_metadata["patient_id"], patch_metadata["image_id"])
+        ]
+        keep_mask = [key in selected_lookup for key in patch_keys]
+        patch_metadata = patch_metadata.loc[keep_mask].reset_index(drop=True)
+        if patch_metadata.empty:
+            raise RuntimeError("No patch metadata rows matched the selected-case filter.")
+        print(f"[INFO] Selected-case patch rows kept: {len(patch_metadata)}")
+
     model, checkpoint, load_msg, proto_k = load_model(args, device, embeddings.shape[1])
     print(f"[INFO] Loaded checkpoint: {args.checkpoint}")
     print(f"[INFO] Model load message: {load_msg}")
@@ -266,6 +424,7 @@ def export_heatmaps(args):
 
     for group_index, ((patient_id, image_id), rows) in enumerate(groups, start=1):
         rows = rows.reset_index(drop=True)
+        selected_info = selected_lookup.get(make_lookup_key(patient_id, image_id), {})
         embedding_rows = rows["embedding_row"].astype(int).to_numpy()
         vectors = embeddings[embedding_rows]
         scores = predict_patch_scores(model, vectors, device, args.batch_size)
@@ -273,26 +432,40 @@ def export_heatmaps(args):
         out_rows = rows.copy()
         for key, value in scores.items():
             out_rows[key] = value
+        if selected_info:
+            out_rows["selection_group"] = selected_info.get("selection_group", "")
+            out_rows["selection_image_name"] = selected_info.get("selection_image_name", "")
         score_rows.append(out_rows)
 
-        meta_row = meta_lookup.get((str(patient_id), str(image_id)), None)
+        meta_row = meta_lookup.get(make_lookup_key(patient_id, image_id), None)
         image_path = (
             str(meta_row.get("image_path"))
             if meta_row is not None and meta_row.get("image_path")
             else str(rows["image_path"].iloc[0])
         )
+        name_prefix = ""
+        if selected_info:
+            group_name = sanitize_key(selected_info.get("selection_group", ""))
+            selected_name = sanitize_key(Path(selected_info.get("selection_image_name", "")).stem)
+            name_prefix = "_".join(part for part in [group_name, selected_name] if part)
+            if name_prefix:
+                name_prefix = f"{name_prefix}_"
         filename = (
-            f"{group_index:05d}_p-{sanitize_key(patient_id)}_"
+            f"{name_prefix}{group_index:05d}_p-{sanitize_key(patient_id)}_"
             f"i-{sanitize_key(image_id)}_uncertainty.png"
         )
+        heatmap_output_dir = heatmap_dir
+        if selected_info and selected_info.get("selection_group"):
+            heatmap_output_dir = heatmap_dir / sanitize_key(selected_info["selection_group"])
         render_heatmap(
             image_path=image_path,
             rows=rows,
             scores=scores["uncertainty"],
             meta_row=meta_row,
-            output_path=heatmap_dir / filename,
+            output_path=heatmap_output_dir / filename,
             alpha=float(args.heatmap_alpha),
             colormap_name=args.colormap,
+            normalize_heatmap=args.normalize_heatmap == "y",
         )
 
     patch_scores_path = None
@@ -312,6 +485,10 @@ def export_heatmaps(args):
         "heatmap_dir": str(heatmap_dir),
         "patch_scores_csv": str(patch_scores_path) if patch_scores_path else None,
         "num_images": len(groups),
+        "selected_csv": str(Path(args.selected_csv)) if args.selected_csv else None,
+        "selected_dcm_root": str(Path(args.selected_dcm_root)) if args.selected_dcm_root else None,
+        "selected_images": len(selected_lookup),
+        "normalize_heatmap": args.normalize_heatmap == "y",
         "note": (
             "Patch/token uncertainty is computed by applying the trained bag-level "
             "DST prototype head to origin_patch embeddings."
