@@ -11,7 +11,10 @@ from torch.utils.data import Dataset
 
 try:
     from imgaug.augmentables.bbs import BoundingBox, BoundingBoxesOnImage
-except ModuleNotFoundError:
+except (ModuleNotFoundError, AttributeError):
+    # imgaug<=0.4 imports np.sctypes, which NumPy 2.0 removed.  Bag-embedding
+    # training does not use imgaug, so keep this optional dependency from
+    # blocking the entire dataset module at import time.
     BoundingBox = None
     BoundingBoxesOnImage = None
 
