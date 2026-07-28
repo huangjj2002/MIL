@@ -2107,8 +2107,19 @@ def main():
     args = config()
     args.edl_proto_normalize = args.edl_proto_normalize == "y"
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
-    print(f"[INFO] Using GPU {args.gpu_id}")
+    scheduler_gpu = os.environ.get("DST_PROTO_SCHEDULER_GPU")
+    if scheduler_gpu is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+        print(f"[INFO] Using GPU {args.gpu_id}")
+    else:
+        # run_embedding_dst_ablation.py has already restricted this subprocess
+        # to one physical GPU.  Its local CUDA index is therefore 0; do not
+        # overwrite CUDA_VISIBLE_DEVICES here or every worker falls onto GPU 0.
+        print(
+            "[INFO] Scheduler assigned physical GPU "
+            f"{scheduler_gpu} (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}; "
+            "using local CUDA device 0)"
+        )
 
     seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

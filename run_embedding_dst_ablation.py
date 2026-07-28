@@ -352,6 +352,10 @@ def stream_command(
 ) -> int:
     child_env = os.environ.copy()
     child_env["CUDA_VISIBLE_DEVICES"] = str(visible_gpu_id)
+    # The trainer receives local GPU 0 because this environment exposes exactly
+    # one physical GPU.  This marker prevents the trainer from overwriting the
+    # scheduler's CUDA_VISIBLE_DEVICES assignment.
+    child_env["DST_PROTO_SCHEDULER_GPU"] = str(visible_gpu_id)
     with log_path.open("w", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
             command,
